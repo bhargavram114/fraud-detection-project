@@ -49,7 +49,7 @@ services:
 
   # ─── Spark ───────────────────────────────────────────────────
   spark-master:
-    image: bitnami/spark:3.5.0
+    image: bitnamilegacy/spark:3.5.0
     container_name: spark-master
     environment:
       SPARK_MODE: master
@@ -64,7 +64,7 @@ services:
       - ./data:/opt/spark-data
 
   spark-worker:
-    image: bitnami/spark:3.5.0
+    image: bitnamilegacy/spark:3.5.0
     container_name: spark-worker
     depends_on: [spark-master]
     environment:

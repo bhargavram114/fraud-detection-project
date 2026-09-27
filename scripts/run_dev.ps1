@@ -4,6 +4,7 @@ param(
     [string]$Mode = "mixed",
     [int]$Tps = 10
 )
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
@@ -18,7 +19,10 @@ if (-not (Test-Path "docker-compose.yml")) {
 Write-Host "`n[1/3] Checking Docker engine..." -ForegroundColor Cyan
 
 $dockerReady = $false
-try { docker info *>$null 2>&1; $dockerReady = $true } catch {}
+try {
+    docker info *> $null 2>&1
+    $dockerReady = $true
+} catch {}
 
 if (-not $dockerReady) {
     $dockerExe = "C:\Program Files\Docker\Docker\Docker Desktop.exe"
@@ -36,7 +40,10 @@ if (-not $dockerReady) {
     while (-not $dockerReady -and $waited -lt 90) {
         Start-Sleep -Seconds 5
         $waited += 5
-        try { docker info *>$null 2>&1; $dockerReady = $true } catch {}
+        try {
+            docker info *> $null 2>&1
+            $dockerReady = $true
+        } catch {}
         Write-Host "        ... ${waited}s" -ForegroundColor DarkGray
     }
 
@@ -46,17 +53,54 @@ if (-not $dockerReady) {
         exit 1
     }
 }
+
 Write-Host "        Docker engine is ready." -ForegroundColor Green
 
 # ── 3. Start Kafka + Spark ───────────────────────────────────────────────────
 Write-Host "`n[2/3] Starting Kafka + Spark..." -ForegroundColor Cyan
-docker-compose up -d
+
+$composeCmd = "docker-compose"
+if (docker compose version *> $null 2>&1) {
+    $composeCmd = "docker compose"
+}
+
+$composeRetries = 0
+while ($composeRetries -lt 5) {
+    try {
+        if ($composeCmd -eq "docker compose") {
+            & docker compose up -d --remove-orphans
+        } else {
+            & docker-compose up -d --remove-orphans
+        }
+        break
+    } catch {
+        if ($composeRetries -ge 4) { throw }
+        $composeRetries++
+        Write-Host "        Docker is still starting; retrying compose startup in 5s ($composeRetries/5)..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 5
+    }
+}
 
 Write-Host "        Waiting 12s for Kafka to be fully ready..." -ForegroundColor DarkGray
 Start-Sleep -Seconds 12
 
 # ── 4. Create Kafka topics ───────────────────────────────────────────────────
 Write-Host "`n[3/3] Creating Kafka topics..." -ForegroundColor Cyan
+
+$kafkaReady = $false
+for ($i = 0; $i -lt 12; $i++) {
+    try {
+        docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list *> $null 2>&1
+        $kafkaReady = $true
+        break
+    } catch {}
+    Start-Sleep -Seconds 5
+}
+
+if (-not $kafkaReady) {
+    Write-Host "[ERROR] Kafka did not become ready within the timeout window." -ForegroundColor Red
+    exit 1
+}
 
 docker exec kafka kafka-topics `
     --bootstrap-server localhost:9092 `
