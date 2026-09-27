@@ -1,7 +1,7 @@
-version: "3.8"
+# version removed — obsolete in Docker Compose v2+
 
 services:
-  # ─── Kafka Ecosystem ───────────────────────────────────────
+
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
@@ -25,29 +25,33 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_LOG_RETENTION_HOURS: 24
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     ports:
       - "8080:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
 
-  # ─── Spark Cluster ─────────────────────────────────────────
   spark-master:
     image: bitnami/spark:3.5.0
     container_name: spark-master
     environment:
       SPARK_MODE: master
-      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
-      SPARK_RPC_ENCRYPTION_ENABLED: "no"
     ports:
-      - "8081:8080"   # Spark Master UI
-      - "7077:7077"   # Spark Master port
+      - "8081:8080"
+      - "7077:7077"
     volumes:
       - ./jobs:/opt/spark-apps
       - ./checkpoints:/opt/spark-checkpoints
@@ -67,7 +71,3 @@ services:
       - ./jobs:/opt/spark-apps
       - ./checkpoints:/opt/spark-checkpoints
       - ./data:/opt/spark-data
-
-volumes:
-  checkpoints:
-  data:
