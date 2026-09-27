@@ -1,0 +1,53 @@
+# app.yaml — Fraud Detection Pipeline Configuration
+# Values here are defaults overridden by environment variables in production
+# Pattern: config["kafka"]["broker"] is overridden by env KAFKA_BROKER
+
+app:
+  name: "atm-fraud-detection"
+  version: "1.0.0"
+  env: "local"          # local | dev | staging | prod
+
+kafka:
+  broker: "localhost:9092"                     # prod: internal LB endpoint
+  input_topic: "transactions"
+  alert_topic: "fraud-alerts"
+  dlq_topic: "fraud-detection-dlq"            # dead-letter queue for bad msgs
+  schema_registry_url: "http://localhost:8081" # Confluent Schema Registry
+  consumer_group: "fraud-detection-v1"
+  max_offsets_per_trigger: 10000              # backpressure control
+  starting_offsets: "latest"                  # prod: "latest" | backfill: "earliest"
+
+spark:
+  shuffle_partitions: 4         # match Kafka partition count locally; 50-200 in prod
+  checkpoint_dir: "/tmp/fraud-detection-checkpoints"  # prod: s3://bucket/checkpoints
+  trigger_interval: "10 seconds"
+  adaptive_enabled: true
+  log_level: "WARN"
+
+storage:
+  parquet_output: "/tmp/fraud-detection-output"  # prod: s3://bucket/fraud-alerts
+  dormant_cards_path: "/tmp/dormant-cards"       # prod: s3://bucket/reference/dormant
+
+thresholds:
+  velocity_txn_limit: 5
+  velocity_window_amount: 50000
+  high_value_single: 30000
+  unusual_hour_min_amount: 5000
+  round_amount_min_txns: 3
+  rapid_merchant_distinct: 4
+  cnp_spike_txns: 3
+  multi_card_terminal: 5
+  sub_threshold_low: 9000
+  sub_threshold_high: 10000
+  sub_threshold_min_txns: 5
+  decline_min_count: 2
+  geo_velocity_countries: 2
+
+monitoring:
+  prometheus_port: 9090
+  health_check_port: 8090
+  metrics_prefix: "fraud_detection"
+
+alerting:
+  pagerduty_integration_key: ""   # set via env in prod
+  slack_webhook_url: ""           # set via env in prod

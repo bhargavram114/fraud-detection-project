@@ -1,0 +1,182 @@
+# k8s-deployment.yaml
+# Deploys the fraud detection Spark job on Kubernetes.
+# Spark on K8s uses the driver-executor model:
+#   - spark-submit creates a Driver pod
+#   - Driver spawns Executor pods dynamically
+#   - No separate Spark master needed — K8s IS the cluster manager
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fraud-detection
+
+---
+# ─── Secrets (in real prod, use HashiCorp Vault or AWS Secrets Manager) ─────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fraud-detection-secrets
+  namespace: fraud-detection
+type: Opaque
+stringData:
+  KAFKA_BROKER: "kafka-internal.prod.svc.cluster.local:9092"
+  CHECKPOINT_DIR: "s3a://prod-data-lake/checkpoints/fraud-detection"
+  PARQUET_OUTPUT: "s3a://prod-data-lake/fraud-alerts"
+  PAGERDUTY_KEY: "<set-in-vault>"
+
+---
+# ─── ConfigMap (non-secret config) ───────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fraud-detection-config
+  namespace: fraud-detection
+data:
+  APP_ENV: "prod"
+  LOG_LEVEL: "WARN"
+
+---
+# ─── Spark Driver Deployment ─────────────────────────────────────────────────
+# In practice you'd use the Spark Operator (https://github.com/kubeflow/spark-operator)
+# which gives you a SparkApplication CRD instead of raw Deployment.
+# Showing raw Deployment here for clarity.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-detection-driver
+  namespace: fraud-detection
+  labels:
+    app: fraud-detection
+    version: "1.0.0"
+spec:
+  replicas: 1        # Always 1 for Spark driver — only executors scale out
+  selector:
+    matchLabels:
+      app: fraud-detection
+      role: driver
+  template:
+    metadata:
+      labels:
+        app: fraud-detection
+        role: driver
+      annotations:
+        # Prometheus auto-scrape via pod annotations
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: spark-driver-sa   # needs pod create/delete permissions
+      containers:
+        - name: spark-driver
+          image: your-registry/fraud-detection:1.0.0
+          imagePullPolicy: Always
+          command:
+            - spark-submit
+            - --master
+            - k8s://https://kubernetes.default.svc:443
+            - --deploy-mode
+            - client
+            - --name
+            - fraud-detection
+            - --packages
+            - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,io.delta:delta-spark_2.12:3.1.0
+            - --conf
+            - spark.kubernetes.namespace=fraud-detection
+            - --conf
+            - spark.kubernetes.container.image=your-registry/fraud-detection:1.0.0
+            - --conf
+            - spark.executor.instances=3
+            - --conf
+            - spark.executor.memory=4g
+            - --conf
+            - spark.executor.cores=2
+            - --conf
+            - spark.driver.memory=2g
+            - --conf
+            - spark.sql.shuffle.partitions=50
+            - /app/jobs/fraud_detection_prod.py
+          envFrom:
+            - secretRef:
+                name: fraud-detection-secrets
+            - configMapRef:
+                name: fraud-detection-config
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+          # Liveness probe hits our health check server
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          # Readiness probe — K8s won't send traffic until this passes
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+---
+# ─── RBAC: Driver needs permission to create Executor pods ───────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spark-driver-sa
+  namespace: fraud-detection
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spark-driver-role
+  namespace: fraud-detection
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["create", "get", "list", "watch", "delete", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spark-driver-rolebinding
+  namespace: fraud-detection
+subjects:
+  - kind: ServiceAccount
+    name: spark-driver-sa
+roleRef:
+  kind: Role
+  name: spark-driver-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ─── Horizontal Pod Autoscaler (for future stateless workers) ────────────────
+# Note: Spark executors are managed by Spark, not HPA.
+# HPA here would apply to a separate API service, not the Spark driver.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fraud-detection-hpa
+  namespace: fraud-detection
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fraud-detection-driver
+  minReplicas: 1
+  maxReplicas: 1   # Driver is always 1; scale executors via spark.executor.instances
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

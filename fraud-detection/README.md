@@ -1,73 +1,143 @@
-# Real-Time ATM Fraud Detection Pipeline
+# ATM Fraud Detection Pipeline
 
-PySpark Structured Streaming pipeline that detects fraudulent ATM/card
-transactions in real time using Kafka as the event backbone.
+Real-time fraud detection using PySpark Structured Streaming + Kafka.
+12 detection rules, full TDD, production-ready.
 
 ## Tech Stack
-| Layer | Technology |
-|---|---|
-| Event streaming | Apache Kafka 3.5 |
-| Stream processing | PySpark Structured Streaming 3.5 |
-| Orchestration | Docker Compose (local) |
-| Storage | Parquet (Data Lake sink) |
-| Language | Python 3.11 |
 
-## Architecture
-```
-[Transaction Generator]
-        │  JSON events @ ~10 TPS
-        ▼
-[Kafka: transactions topic]  ◄─── 3 partitions
-        │
-        ▼
-[Spark Structured Streaming]
-   ├── Watermark: 2 minutes (handles late data)
-   ├── Sliding windows: 5 min / 1 min slide
-   │
-   ├── Rule 1: Velocity (>5 txns OR >₹50k in window)
-   └── Rule 2: High-value (single txn >₹30k)
-        │
-        ├──► [Kafka: fraud-alerts topic]  → downstream consumers
-        ├──► [Parquet: /data/fraud_alerts/]  → audit trail / batch
-        └──► [Console]  → development monitoring
-```
+| Layer       | Technology                        |
+|-------------|-----------------------------------|
+| Language    | Python 3.11                       |
+| Packaging   | uv (pyproject.toml)               |
+| Processing  | PySpark 3.5 Structured Streaming  |
+| Messaging   | Apache Kafka 3.5                  |
+| Containers  | Docker Desktop (Windows 11)       |
 
-## Fraud Detection Rules
-| Rule | Condition | Output Mode |
-|---|---|---|
-| Velocity | >5 transactions per card in 5-min window | `update` |
-| High Amount | Total spend >₹50,000 in 5-min window | `update` |
-| High Value | Single transaction >₹30,000 | `append` |
+## Prerequisites (Windows 11)
 
-## Quick Start
-```bash
-bash scripts/run_local.sh
+1. **Docker Desktop** — https://www.docker.com/products/docker-desktop/
+2. **uv** — run in PowerShell (Admin):
+   ```powershell
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+3. **Java 11+** (required by Spark) — https://adoptium.net/
+   Set `JAVA_HOME` in System Environment Variables after install.
+
+## First-Time Setup
+
+```powershell
+# Clone / extract project, then from project root:
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser   # one time only
+.\scripts\setup_windows.ps1
 ```
 
-## Key Concepts & Interview Answers
+This script:
+- Installs Python 3.11 via uv
+- Creates `.venv` pinned to Python 3.11
+- Installs all dependencies from `pyproject.toml`
 
-### Why watermarking?
-In ATM networks, events arrive out of order due to network retries, timeouts,
-and switch failovers — exactly like NDC retransmission scenarios.
-Without `withWatermark("event_time", "2 minutes")`, Spark would keep every
-window's state in memory forever, causing OOM. The watermark tells Spark:
-"any event arriving more than 2 minutes late can be safely dropped."
+## Daily Workflow
 
-### Why sliding windows vs tumbling?
-A fraud burst that straddles a window boundary (e.g. 4 txns at 11:59,
-4 txns at 12:01) would escape a tumbling window (5 txns max per window).
-Sliding windows overlap, so the burst appears in multiple windows and is caught.
+```powershell
+# Start infrastructure + see instructions
+.\scripts\run_dev.ps1
 
-### Why `outputMode("update")` for Kafka but `outputMode("append")` for Parquet?
-- `append` only emits finalised (watermark-passed) windows. Safe for files.
-- `update` emits every time a window changes. Good for real-time downstream consumers.
-- `complete` emits the full result table every trigger. Too expensive at scale.
+# Terminal 2 — Spark job
+uv run spark-submit `
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 `
+  jobs\fraud_detection.py
 
-### Exactly-once semantics
-Checkpointing + Kafka's idempotent producer gives end-to-end exactly-once:
-Spark tracks Kafka offsets in the checkpoint dir. On restart, it replays
-from the last committed offset, not from scratch.
+# Terminal 3 — Transaction generator
+uv run python producer\transaction_generator.py --mode mixed --tps 10
+```
 
-### Parallelism
-Kafka partitions (3) = Spark task parallelism for that stage.
-`spark.sql.shuffle.partitions=4` avoids the default-200 shuffle overhead.
+## Running Tests
+
+```powershell
+# Full suite with coverage
+.\scripts\run_tests.ps1
+
+# Quick run
+uv run pytest tests/ -v
+
+# Single rule
+uv run pytest tests/test_transforms.py::TestGeoVelocity -v
+```
+
+## Adding a Dependency
+
+```powershell
+uv add <package>          # adds to pyproject.toml + updates uv.lock
+uv add --dev <package>    # dev-only (pytest plugins, linters)
+uv sync                   # sync venv after manual pyproject.toml edits
+```
+
+## Project Structure
+
+```
+fraud-detection/
+├── pyproject.toml                  ← uv config, Python 3.11 pinned
+├── uv.lock                         ← generated by uv, commit this
+├── Dockerfile                      ← multi-stage, uv in builder
+├── docker-compose.yml              ← Kafka + Spark
+├── config/
+│   └── app.yaml                    ← all thresholds + env config
+├── jobs/
+│   ├── schemas.py                  ← TRANSACTION_SCHEMA (txn_status included)
+│   ├── fraud_detection.py          ← dev job (console sink)
+│   ├── fraud_detection_prod.py     ← prod job (DLQ, health, logging)
+│   └── rules/
+│       ├── transforms.py           ← 12 pure functions (batch-testable)
+│       └── fraud_rules.py          ← streaming wrappers (withWatermark)
+├── producer/
+│   └── transaction_generator.py   ← ATM txn simulator + fraud bursts
+├── tests/
+│   ├── conftest.py                 ← SparkSession + make_txn factory
+│   ├── test_schema.py              ← schema contract (5 tests)
+│   └── test_transforms.py         ← all 12 rules (46 tests) — 51 total
+└── scripts/
+    ├── setup_windows.ps1           ← one-time setup
+    ├── run_dev.ps1                 ← daily dev start
+    └── run_tests.ps1              ← pytest + coverage
+```
+
+## 12 Fraud Detection Rules
+
+| # | Rule                    | Window      | Risk |
+|---|-------------------------|-------------|------|
+| 1 | Velocity Check          | 5min/1min   | 85   |
+| 2 | High Value Single Txn   | none        | 80   |
+| 3 | High Window Amount      | 5min/1min   | 90   |
+| 4 | Geographic Velocity     | 30min/5min  | 95   |
+| 5 | Unusual Hour            | none        | 50   |
+| 6 | Round Amount Structuring| 10min/2min  | 75   |
+| 7 | Rapid Merchant Switch   | 5min/1min   | 70   |
+| 8 | Card-Not-Present Spike  | 10min/2min  | 65   |
+| 9 | Multi-Card Terminal     | 10min/2min  | 80   |
+|10 | Dormant Card Activation | none        | 60   |
+|11 | Sub-Threshold Structuring| 1hr/5min   | 85   |
+|12 | Declined then Approved  | 10min/2min  | 90   |
+
+## TDD Approach
+
+```
+tests/transforms.py         ← tests written FIRST (RED)
+jobs/rules/transforms.py    ← implementation to make tests GREEN
+jobs/rules/fraud_rules.py   ← streaming wrappers (not unit tested directly)
+```
+
+Key insight: `withWatermark()` only works on streaming DataFrames.
+Separating pure transforms (testable in batch) from streaming wrappers
+makes all 12 rules fully unit-testable without a Kafka cluster.
+
+## uv vs pip Cheat Sheet
+
+| Action                  | pip                         | uv                        |
+|-------------------------|-----------------------------|---------------------------|
+| Install all deps        | pip install -r requirements | uv sync                   |
+| Add a package           | pip install X               | uv add X                  |
+| Remove a package        | pip uninstall X             | uv remove X               |
+| Run a script            | python script.py            | uv run python script.py   |
+| Run pytest              | pytest                      | uv run pytest             |
+| Create venv             | python -m venv .venv        | uv venv --python 3.11     |
+| Lock file               | pip freeze > requirements   | uv lock (auto)            |

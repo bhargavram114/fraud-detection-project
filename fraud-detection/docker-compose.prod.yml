@@ -1,0 +1,126 @@
+version: "3.8"
+
+# Production-equivalent local stack:
+# Kafka + Schema Registry + Spark + Prometheus + Grafana + ELK
+
+services:
+
+  # ─── Kafka Ecosystem ─────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports: ["2181:2181"]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 72
+      # Enable JMX metrics for Prometheus
+      KAFKA_JMX_PORT: 9999
+      KAFKA_JMX_HOSTNAME: kafka
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: schema-registry
+    depends_on: [kafka]
+    ports: ["8081:8081"]
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on: [kafka, schema-registry]
+    ports: ["8080:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+
+  # ─── Spark ───────────────────────────────────────────────────
+  spark-master:
+    image: bitnami/spark:3.5.0
+    container_name: spark-master
+    environment:
+      SPARK_MODE: master
+      SPARK_METRICS_ENABLED: "true"          # expose Prometheus metrics
+    ports:
+      - "8082:8080"
+      - "7077:7077"
+    volumes:
+      - ./jobs:/opt/spark-apps
+      - ./config:/opt/spark-config
+      - ./checkpoints:/opt/spark-checkpoints
+      - ./data:/opt/spark-data
+
+  spark-worker:
+    image: bitnami/spark:3.5.0
+    container_name: spark-worker
+    depends_on: [spark-master]
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 4G
+      SPARK_WORKER_CORES: 4
+    volumes:
+      - ./jobs:/opt/spark-apps
+      - ./checkpoints:/opt/spark-checkpoints
+      - ./data:/opt/spark-data
+
+  # ─── Prometheus + Grafana (Observability) ────────────────────
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports: ["9090:9090"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    depends_on: [prometheus]
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./monitoring/grafana-dashboards:/var/lib/grafana/dashboards
+
+  # ─── ELK Stack (Log Aggregation) ─────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports: ["9200:9200"]
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: kibana
+    depends_on: [elasticsearch]
+    ports: ["5601:5601"]
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.0
+    container_name: logstash
+    depends_on: [elasticsearch]
+    volumes:
+      - ./monitoring/logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+
+volumes:
+  checkpoints:
+  data:
