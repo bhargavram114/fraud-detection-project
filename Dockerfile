@@ -1,11 +1,11 @@
-# Multi-stage build — uv installs deps, bitnami/spark is the runtime
+# Multi-stage build — uv installs deps, bitnamilegacy/spark is the runtime
 FROM python:3.11-slim AS builder
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /build
 COPY pyproject.toml .
 RUN uv sync --python 3.11 --no-dev --no-install-project
 
-FROM bitnami/spark:3.5.0
+FROM bitnamilegacy/spark:3.5.0
 USER root
 COPY --from=builder /build/.venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"

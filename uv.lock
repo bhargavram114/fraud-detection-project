@@ -5,7 +5,7 @@ requires-python = "==3.11.*"
 [[package]]
 name = "atm-fraud-detection"
 version = "1.0.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "faker" },
     { name = "kafka-python" },

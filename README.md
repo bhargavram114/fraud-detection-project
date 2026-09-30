@@ -58,6 +58,17 @@ uv run pytest tests\test_transforms.py -v      # transforms only
 uv run pytest tests\test_transforms.py::TestGeoVelocity -v   # single rule
 ```
 
+## Package Source
+```powershell
+.\scripts\pack_source.ps1                       # source ZIP (default)
+.\scripts\pack_source.ps1 -Format Wheel         # Python wheel
+.\scripts\pack_source.ps1 -Format Sdist         # Python source distribution
+.\scripts\pack_source.ps1 -Format Python        # wheel + source distribution
+.\scripts\pack_source.ps1 -Format Zip -OutputDirectory .\artifacts
+```
+
+Packages are written to `dist\` by default. ZIP archives omit generated files, virtual environments, checkpoints, and runtime data. `.nupkg` is a NuGet/.NET package format; use the ZIP or Python distribution formats for this project.
+
 ## Project Structure
 ```
 fraud-detection/
@@ -84,7 +95,8 @@ fraud-detection/
 │   ├── setup_windows.ps1            ← one-time setup
 │   ├── run_dev.ps1                  ← start all services (auto-starts Docker)
 │   ├── stop_dev.ps1                 ← stop all services + containers + Docker
-│   └── run_tests.ps1               ← pytest + coverage
+│   ├── run_tests.ps1               ← pytest + coverage
+│   └── pack_source.ps1             ← ZIP or Python package builder
 └── deploy/
     ├── k8s-deployment.yaml          ← Kubernetes manifests + RBAC
     └── ci-cd.yml                    ← GitHub Actions pipeline
