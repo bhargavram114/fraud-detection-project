@@ -39,7 +39,7 @@ from pyspark.sql.types import StringType
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from jobs.schemas import TRANSACTION_SCHEMA
-from jobs.rules.fraud_rules import RULE_REGISTRY
+from jobs.rules.fraud_rules import build_rules
 
 # ── Local config ──────────────────────────────────────────────────────────────
 KAFKA_BROKER  = "localhost:9092"
@@ -89,7 +89,9 @@ def main():
     # Note: rule_dormant_card (Rule 10) needs a reference DataFrame and is
     # omitted in the dev job for simplicity. It runs in the prod job.
     alert_dfs = []
-    for rule_fn in RULE_REGISTRY:
+    # build_rules() uses the default thresholds (they mirror config/app.yaml).
+    # The prod job passes the thresholds loaded from the YAML instead.
+    for rule_fn in build_rules():
         try:
             alert_dfs.append(rule_fn(parsed))
         except Exception as e:

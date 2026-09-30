@@ -1,4 +1,11 @@
-# Multi-stage build — uv installs deps, bitnamilegacy/spark is the runtime
+# Multi-stage build — uv installs deps, bitnamilegacy/spark is the runtime.
+#
+# WHY bitnamilegacy AND NOT bitnami:
+#   Since Aug 2025 Bitnami moved versioned tags (e.g. spark:3.5.0) from
+#   docker.io/bitnami to docker.io/bitnamilegacy. The legacy repo gets no
+#   updates or security patches. It is the same image family docker-compose*.yml
+#   uses, so local and container builds now match. For a real production image
+#   consider the official apache/spark image instead.
 FROM python:3.11-slim AS builder
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /build

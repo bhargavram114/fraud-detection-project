@@ -4,11 +4,13 @@ transforms.py — Pure transformation functions for all 12 fraud rules.
 ═══════════════════════════════════════════════════════════════════════════════
 KEY DESIGN DECISION — WHY SEPARATE TRANSFORMS FROM STREAMING WRAPPERS?
 ═══════════════════════════════════════════════════════════════════════════════
-  withWatermark() is a streaming-only operation. Calling it on a batch
-  DataFrame raises AnalysisException. This makes rules impossible to
-  unit-test if watermarking lives inside the rule function itself.
+  withWatermark() only matters for streaming queries. On a batch DataFrame it
+  is accepted and has no effect (verified on Spark 3.5.0 — it does NOT raise
+  AnalysisException). We still keep it out of the rule logic because the
+  watermark delay is a streaming/operational setting, not business logic:
+  one delay is applied to every rule in one place, and the rules stay pure.
 
-  Solution — two layers:
+  Two layers:
 
     transforms.py  (THIS FILE)
       Pure functions. Accept any DataFrame — batch or streaming.
@@ -17,7 +19,7 @@ KEY DESIGN DECISION — WHY SEPARATE TRANSFORMS FROM STREAMING WRAPPERS?
 
     fraud_rules.py (STREAMING WRAPPERS)
       Thin wrappers. Call df.withWatermark(...) then delegate here.
-      → Not unit-tested directly; covered by integration tests.
+      → Covered by tests/test_streaming_smoke.py (runs a real streaming query).
 
   This mirrors how you'd design it in C#:
     Business logic in a service class (testable, no I/O).
@@ -43,7 +45,15 @@ from pyspark.sql import DataFrame
 from pyspark.sql.functions import (
     col, count, sum as _sum, max as _max,
     countDistinct, lit, when, hour, window,
+    collect_list, sort_array, from_utc_timestamp,
+    md5, concat_ws, unix_timestamp, floor,
 )
+
+from jobs.rules.thresholds import resolve
+
+# Every rule takes an optional `thresholds` dict (see thresholds.py). None means
+# the defaults, which mirror config/app.yaml. The prod job passes the values
+# loaded from app.yaml so tuning the YAML really changes behaviour.
 
 # ── Window size constants ─────────────────────────────────────────────────────
 # Format: (duration, slide_interval)
@@ -100,10 +110,47 @@ def _to_alert(df: DataFrame, rule_name: str) -> DataFrame:
     )
 
 
+def with_alert_id(df: DataFrame, bucket_seconds: int = 3600) -> DataFrame:
+    """
+    Add a deterministic `alert_id` used downstream as an idempotency key.
+
+    THE PROBLEM:
+      With sliding windows one fraud burst lands in several overlapping windows
+      (a 5-min window sliding every 1 min -> up to 5 alerts, each with a
+      different window_start). Hashing window_start directly gave one ID per
+      window, i.e. several IDs for one incident. Bucketing by the window's own
+      length does not help: the windows that contain a burst span several
+      minutes of start times, so they often straddle a bucket edge anyway.
+
+    THE FIX — alert throttling per (card, rule, time bucket):
+      - Aggregated rules: hash (card_id, rule, floor(window_start / bucket)),
+        bucket = 1 hour by default. All overlapping windows of one burst share
+        an ID unless the burst straddles a clock-hour boundary (then 2 IDs).
+        TRADE-OFF: two separate bursts on the same card+rule inside one bucket
+        also share an ID, so an idempotent consumer keeps only the first.
+        That is deliberate ("one open alert per card per rule per hour") but is
+        a policy choice; lower bucket_seconds for finer alerts.
+      - Row-level rules (window_start == window_end, i.e. rules 2, 5, 10):
+        hash the exact event timestamp, so two large withdrawals seconds apart
+        stay two distinct alerts.
+
+    KNOWN LIMIT: Rule 9 groups by terminal and reports a representative card
+    (max card_id), which can differ between overlapping windows.
+    """
+    is_row_level = col("window_end") <= col("window_start")
+    slot = when(is_row_level, col("window_start").cast("string")).otherwise(
+        floor(unix_timestamp(col("window_start")) / bucket_seconds).cast("string")
+    )
+    return df.withColumn(
+        "alert_id",
+        md5(concat_ws("|", col("card_id"), col("rule_triggered"), slot)),
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 1 — Velocity Check
 # ══════════════════════════════════════════════════════════════════════════════
-def velocity_check(df: DataFrame) -> DataFrame:
+def velocity_check(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
     Flag any card with more than 5 transactions in a 5-minute sliding window.
 
@@ -125,13 +172,14 @@ def velocity_check(df: DataFrame) -> DataFrame:
       accumulate in the state store forever → OOM. The watermark tells
       Spark it's safe to evict windows older than (max_event_time - delay).
     """
+    t = resolve(thresholds)
     agg = (
         df.groupBy(window(col("event_time"), *W5M), col("card_id"))
         .agg(
             count("txn_id").alias("txn_count"),
             _sum("amount").alias("total_amount"),
         )
-        .filter(col("txn_count") > 5)
+        .filter(col("txn_count") > t["velocity_txn_limit"])
         .withColumn("window_start", col("window.start"))
         .withColumn("window_end",   col("window.end"))
     )
@@ -141,7 +189,7 @@ def velocity_check(df: DataFrame) -> DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 2 — High Value Single Transaction
 # ══════════════════════════════════════════════════════════════════════════════
-def high_value_single(df: DataFrame) -> DataFrame:
+def high_value_single(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
     Flag any single transaction exceeding ₹30,000.
 
@@ -161,8 +209,9 @@ def high_value_single(df: DataFrame) -> DataFrame:
       Row-level filters with no aggregation produce append-only output
       naturally — each event either matches or doesn't, with no updates.
     """
+    t = resolve(thresholds)
     filtered = (
-        df.filter(col("amount") > 30_000)
+        df.filter(col("amount") > t["high_value_single"])
         .withColumn("window_start", col("event_time"))
         .withColumn("window_end",   col("event_time"))
         .withColumn("txn_count",    lit(1))
@@ -174,7 +223,7 @@ def high_value_single(df: DataFrame) -> DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 3 — High Window Amount
 # ══════════════════════════════════════════════════════════════════════════════
-def high_window_amount(df: DataFrame) -> DataFrame:
+def high_window_amount(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
     Flag when a card's total spend exceeds ₹50,000 in any 5-minute window.
 
@@ -188,13 +237,14 @@ def high_window_amount(df: DataFrame) -> DataFrame:
     Together, Rules 1, 2, and 3 cover the full fraud surface for
     amount-based card abuse.
     """
+    t = resolve(thresholds)
     agg = (
         df.groupBy(window(col("event_time"), *W5M), col("card_id"))
         .agg(
             count("txn_id").alias("txn_count"),
             _sum("amount").alias("total_amount"),
         )
-        .filter(col("total_amount") > 50_000)
+        .filter(col("total_amount") > t["velocity_window_amount"])
         .withColumn("window_start", col("window.start"))
         .withColumn("window_end",   col("window.end"))
     )
@@ -204,7 +254,7 @@ def high_window_amount(df: DataFrame) -> DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 4 — Geographic Velocity (Impossible Travel)
 # ══════════════════════════════════════════════════════════════════════════════
-def geo_velocity(df: DataFrame) -> DataFrame:
+def geo_velocity(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
     Flag the same card used in 2+ different countries within 30 minutes.
 
@@ -228,6 +278,7 @@ def geo_velocity(df: DataFrame) -> DataFrame:
       cross-border txn is likely legitimate; it's the burst pattern
       that confirms fraud. Risk-score weighting helps here.
     """
+    t = resolve(thresholds)
     agg = (
         df.groupBy(window(col("event_time"), *W30M), col("card_id"))
         .agg(
@@ -235,7 +286,7 @@ def geo_velocity(df: DataFrame) -> DataFrame:
             count("txn_id").alias("txn_count"),
             _sum("amount").alias("total_amount"),
         )
-        .filter(col("country_count") > 1)
+        .filter(col("country_count") >= t["geo_velocity_countries"])
         .withColumn("window_start", col("window.start"))
         .withColumn("window_end",   col("window.end"))
     )
@@ -245,9 +296,9 @@ def geo_velocity(df: DataFrame) -> DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 5 — Unusual Hour Transaction
 # ══════════════════════════════════════════════════════════════════════════════
-def unusual_hour(df: DataFrame) -> DataFrame:
+def unusual_hour(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
-    Flag transactions between 01:00–04:00 UTC with amount > ₹5,000.
+    Flag transactions in [01:00, 04:00) LOCAL time with amount > ₹5,000.
 
     WHY BOTH CONDITIONS?
       Late-night ATM activity is statistically anomalous but not impossible.
@@ -255,21 +306,31 @@ def unusual_hour(df: DataFrame) -> DataFrame:
       (petrol, convenience store) that happen at odd hours, and focuses
       the rule on significant withdrawals/transfers where risk is higher.
 
-    TIMEZONE NOTE:
-      event_time is stored in UTC. In production you would join with a
-      terminal timezone lookup table to compare against local time,
-      because 2AM UTC = 7:30AM IST, which is not unusual at all.
-      For this portfolio project we use UTC as a simplification.
+    TIMEZONE HANDLING:
+      event_time is stored in UTC, but "unusual" is a local-time notion
+      (2AM UTC = 7:30AM IST is a normal morning). The hour is computed with
+      from_utc_timestamp(event_time, unusual_hour_timezone). app.yaml sets
+      Asia/Kolkata for this INR pipeline; the code default is UTC so unit
+      tests are timezone-independent. One timezone per pipeline is still a
+      simplification — a multi-country deployment would join a per-terminal
+      timezone lookup instead.
+
+    BOUNDARIES:
+      Half-open interval [start, end): 01:00:00 is flagged, 04:00:00 is not.
+      (The old between(1, 4) also flagged everything up to 04:59.)
 
     LOWEST RISK SCORE (50):
       This rule is a contextual signal, not a standalone fraud indicator.
       It should be combined with other rules in a risk-scoring engine
       rather than used to block transactions outright.
     """
+    t = resolve(thresholds)
+    local_hour = hour(from_utc_timestamp(col("event_time"), t["unusual_hour_timezone"]))
     filtered = (
         df.filter(
-            hour(col("event_time")).between(1, 4) &
-            (col("amount") > 5_000)
+            (local_hour >= t["unusual_hour_start"]) &
+            (local_hour <  t["unusual_hour_end"]) &
+            (col("amount") > t["unusual_hour_min_amount"])
         )
         .withColumn("window_start", col("event_time"))
         .withColumn("window_end",   col("event_time"))
@@ -282,7 +343,7 @@ def unusual_hour(df: DataFrame) -> DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 6 — Round Amount Structuring
 # ══════════════════════════════════════════════════════════════════════════════
-def round_amount_structuring(df: DataFrame) -> DataFrame:
+def round_amount_structuring(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
     Flag 3+ transactions of exact round amounts (divisible by 1000) in 10 min.
 
@@ -304,14 +365,15 @@ def round_amount_structuring(df: DataFrame) -> DataFrame:
       Mention PMLA and FIU-IND in interviews — it shows you understand
       why the rule exists, not just how to implement it.
     """
+    t = resolve(thresholds)
     agg = (
-        df.filter(col("amount") % 1000 == 0)     # exact round thousands only
+        df.filter(col("amount") % t["round_amount_modulo"] == 0)     # exact round thousands only
         .groupBy(window(col("event_time"), *W10M), col("card_id"))
         .agg(
             count("txn_id").alias("txn_count"),
             _sum("amount").alias("total_amount"),
         )
-        .filter(col("txn_count") >= 3)
+        .filter(col("txn_count") >= t["round_amount_min_txns"])
         .withColumn("window_start", col("window.start"))
         .withColumn("window_end",   col("window.end"))
     )
@@ -321,7 +383,7 @@ def round_amount_structuring(df: DataFrame) -> DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 7 — Rapid Merchant Switching
 # ══════════════════════════════════════════════════════════════════════════════
-def rapid_merchant_switch(df: DataFrame) -> DataFrame:
+def rapid_merchant_switch(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
     Flag a card used at 4+ distinct merchants within a 5-minute window.
 
@@ -343,6 +405,7 @@ def rapid_merchant_switch(df: DataFrame) -> DataFrame:
       (approxCountDistinct) is much cheaper — O(1) memory vs O(n).
       Here, merchant_count per card per 5 min is tiny, so exact is fine.
     """
+    t = resolve(thresholds)
     agg = (
         df.groupBy(window(col("event_time"), *W5M), col("card_id"))
         .agg(
@@ -350,7 +413,7 @@ def rapid_merchant_switch(df: DataFrame) -> DataFrame:
             count("txn_id").alias("txn_count"),
             _sum("amount").alias("total_amount"),
         )
-        .filter(col("merchant_count") > 4)
+        .filter(col("merchant_count") > t["rapid_merchant_distinct"])
         .withColumn("window_start", col("window.start"))
         .withColumn("window_end",   col("window.end"))
     )
@@ -360,7 +423,7 @@ def rapid_merchant_switch(df: DataFrame) -> DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 8 — Card-Not-Present (CNP) Spike
 # ══════════════════════════════════════════════════════════════════════════════
-def cnp_spike(df: DataFrame) -> DataFrame:
+def cnp_spike(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
     Flag 3+ ONLINE (Card-Not-Present) transactions from one card in 10 minutes.
 
@@ -381,6 +444,7 @@ def cnp_spike(df: DataFrame) -> DataFrame:
       are used exclusively online. The buyer has the numbers but not the
       physical card. This rule specifically targets that attack vector."
     """
+    t = resolve(thresholds)
     agg = (
         df.filter(col("channel") == "ONLINE")    # pre-filter before windowing
         .groupBy(window(col("event_time"), *W10M), col("card_id"))
@@ -388,7 +452,7 @@ def cnp_spike(df: DataFrame) -> DataFrame:
             count("txn_id").alias("txn_count"),
             _sum("amount").alias("total_amount"),
         )
-        .filter(col("txn_count") > 3)
+        .filter(col("txn_count") > t["cnp_spike_txns"])
         .withColumn("window_start", col("window.start"))
         .withColumn("window_end",   col("window.end"))
     )
@@ -398,7 +462,7 @@ def cnp_spike(df: DataFrame) -> DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 9 — Multiple Cards at Same Terminal
 # ══════════════════════════════════════════════════════════════════════════════
-def multi_card_terminal(df: DataFrame) -> DataFrame:
+def multi_card_terminal(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
     Flag an ATM terminal with 5+ distinct cards transacting within 10 minutes.
 
@@ -421,6 +485,7 @@ def multi_card_terminal(df: DataFrame) -> DataFrame:
       behaving strangely?' — this one asks 'is this terminal behaving
       strangely?' It's a supply-side vs. demand-side perspective on fraud."
     """
+    t = resolve(thresholds)
     agg = (
         df.groupBy(window(col("event_time"), *W10M), col("terminal_id"))
         .agg(
@@ -429,7 +494,7 @@ def multi_card_terminal(df: DataFrame) -> DataFrame:
             _sum("amount").alias("total_amount"),
             _max("card_id").alias("card_id"),   # representative card for output schema
         )
-        .filter(col("card_count") > 5)
+        .filter(col("card_count") > t["multi_card_terminal"])
         .withColumn("window_start", col("window.start"))
         .withColumn("window_end",   col("window.end"))
     )
@@ -450,13 +515,17 @@ def dormant_card(df: DataFrame, dormant_ref_df: DataFrame) -> DataFrame:
       At streaming job startup, fraud_detection_prod.py reads this file
       as a static DataFrame and passes it here.
 
-    STREAM-STATIC JOIN PATTERN:
-      This is a "stream-static join" — one side is the live event stream,
-      the other is a static lookup table. Spark automatically broadcasts
-      the static side (small, fits in memory) to every executor.
-      No shuffle needed — this is the most efficient join type in Spark.
-      In contrast, stream-stream joins require both sides to be watermarked
-      and involve complex state management.
+    STREAM-STATIC JOIN PATTERN (behaviour verified on Spark 3.5.0):
+      One side is the live event stream, the other a static lookup table.
+      - The static side is broadcast (BroadcastHashJoin) as long as its
+        estimated size is under spark.sql.autoBroadcastJoinThreshold (10 MB
+        by default). A large dormant list would fall back to a shuffle join,
+        so keep the list small or raise the threshold / wrap it in broadcast().
+      - The static DataFrame is scanned again in every micro-batch, but its
+        FILE LIST is fixed when the DataFrame is created. Files the nightly
+        job adds afterwards are NOT seen until the streaming job restarts.
+      - Stream-stream joins, by contrast, need both sides watermarked and keep
+        join state.
 
     WHY DORMANT CARD FRAUD HAPPENS:
       Fraudsters sometimes obtain card details but wait weeks or months
@@ -485,7 +554,7 @@ def dormant_card(df: DataFrame, dormant_ref_df: DataFrame) -> DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 11 — Sub-Threshold Structuring
 # ══════════════════════════════════════════════════════════════════════════════
-def sub_threshold_structuring(df: DataFrame) -> DataFrame:
+def sub_threshold_structuring(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
     Flag 5+ transactions each between ₹9,000–₹9,999 within a 1-hour window.
 
@@ -509,14 +578,15 @@ def sub_threshold_structuring(df: DataFrame) -> DataFrame:
       Both rules can fire on the same card simultaneously, which increases
       the combined risk signal.
     """
+    t = resolve(thresholds)
     agg = (
-        df.filter((col("amount") >= 9_000) & (col("amount") < 10_000))
+        df.filter((col("amount") >= t["sub_threshold_low"]) & (col("amount") < t["sub_threshold_high"]))
         .groupBy(window(col("event_time"), *W1H), col("card_id"))
         .agg(
             count("txn_id").alias("txn_count"),
             _sum("amount").alias("total_amount"),
         )
-        .filter(col("txn_count") >= 5)
+        .filter(col("txn_count") >= t["sub_threshold_min_txns"])
         .withColumn("window_start", col("window.start"))
         .withColumn("window_end",   col("window.end"))
     )
@@ -526,10 +596,11 @@ def sub_threshold_structuring(df: DataFrame) -> DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 # RULE 12 — Declined then Approved
 # ══════════════════════════════════════════════════════════════════════════════
-def declined_then_approved(df: DataFrame) -> DataFrame:
+def declined_then_approved(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
     """
     Flag a card with 2+ DECLINED transactions followed by an APPROVED one
-    within the same 10-minute window.
+    within the same 10-minute window. ORDER MATTERS: the approval must come
+    after the Nth decline (N = decline_min_count).
 
     WHY THIS DETECTS PIN BRUTE-FORCE / CARD TESTING:
       When a stolen card is used at an ATM with an unknown PIN, the attacker
@@ -551,7 +622,7 @@ def declined_then_approved(df: DataFrame) -> DataFrame:
         an approvals stream. Requires both sides to be watermarked, complex
         state management, harder to test.
       Option B (this implementation): single groupBy with conditional
-        aggregation using when(). One pass, no join, no extra state,
+        aggregation using when(). One pass, no join, minimal extra state,
         fully testable in batch mode.
 
         count(when(col("txn_status") == "DECLINED", 1))
@@ -559,8 +630,16 @@ def declined_then_approved(df: DataFrame) -> DataFrame:
         count(when(col("txn_status") == "APPROVED", 1))
           → counts only APPROVED rows within each window group
 
-      Option B is simpler, faster, and produces identical results.
-      This is the correct production approach.
+      Option B needs no join state and is simpler to test.
+
+    HOW ORDER IS ENFORCED (single aggregation, still no join):
+      decline_times      = sorted list of DECLINED event_times in the window
+      last_approval_time = latest APPROVED event_time in the window
+      Alert only if last_approval_time > decline_times[N-1], i.e. some approval
+      happened after at least N declines. "approvals first, declines later" and
+      "1 decline, approval, 1 decline" no longer fire.
+      collect_list only holds DECLINED timestamps for one card in one window,
+      which is small, so the extra state is negligible.
 
     INTERVIEW TIP:
       If asked "why not a stream-stream join?", explain the trade-offs:
@@ -568,18 +647,29 @@ def declined_then_approved(df: DataFrame) -> DataFrame:
       separate state stores, and complicate checkpoint recovery. The
       conditional aggregation achieves the same logic in one operator.
     """
+    t = resolve(thresholds)
+    n = t["decline_min_count"]
     agg = (
         df.groupBy(window(col("event_time"), *W10M), col("card_id"))
         .agg(
             # Conditional counts — count only rows matching each status
             count(when(col("txn_status") == "DECLINED", 1)).alias("decline_count"),
             count(when(col("txn_status") == "APPROVED", 1)).alias("approve_count"),
+            # Ordering evidence: when did declines happen, when was the last approval?
+            sort_array(
+                collect_list(when(col("txn_status") == "DECLINED", col("event_time")))
+            ).alias("decline_times"),
+            _max(
+                when(col("txn_status") == "APPROVED", col("event_time"))
+            ).alias("last_approval_time"),
             count("txn_id").alias("txn_count"),
             _sum("amount").alias("total_amount"),
         )
         .filter(
-            (col("decline_count") >= 2) &   # at least 2 failures
-            (col("approve_count") >= 1)      # followed by at least 1 success
+            (col("decline_count") >= n) &                       # at least N failures
+            (col("approve_count") >= 1) &                       # at least 1 success
+            # ...and a success AFTER the Nth failure (null if fewer than N declines)
+            (col("last_approval_time") > col("decline_times")[n - 1])
         )
         .withColumn("window_start", col("window.start"))
         .withColumn("window_end",   col("window.end"))

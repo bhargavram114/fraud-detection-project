@@ -25,6 +25,7 @@ RUN:
 
 import argparse
 import json
+import os
 import random
 import time
 import uuid
@@ -36,7 +37,7 @@ from kafka import KafkaProducer
 fake = Faker()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-KAFKA_BROKER   = "localhost:9092"
+KAFKA_BROKER   = os.getenv("KAFKA_BROKER", "localhost:9092")
 TOPIC          = "transactions"
 
 # Merchant Category Codes (MCC equivalents — same concept as ATM type codes)
@@ -112,11 +113,21 @@ def build_producer() -> KafkaProducer:
     """
     return KafkaProducer(
         bootstrap_servers=KAFKA_BROKER,
+        # Key = card_id: Kafka hashes the key to pick a partition, so every event
+        # for one card lands in the SAME partition and stays in order.
+        # Without a key, events are spread round-robin and one card's events can
+        # be consumed out of order across partitions.
+        key_serializer=lambda k: k.encode("utf-8") if k is not None else None,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         linger_ms=5,
         acks="all",
         retries=3,
     )
+
+
+def send_txn(producer, txn: dict) -> None:
+    """Publish one transaction, keyed by card_id (see build_producer)."""
+    producer.send(TOPIC, key=txn["card_id"], value=txn)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -138,13 +149,13 @@ def run(mode: str, tps: int):
                 fraud_card = random.choice(CARD_POOL)
                 bursts     = make_fraud_burst(fraud_card)
                 for txn in bursts:
-                    producer.send(TOPIC, value=txn)
+                    send_txn(producer, txn)
                 sent += len(bursts)
                 print(f"  ⚠️  [FRAUD BURST] card={fraud_card[:8]}... "
                       f"count={len(bursts)} — watch for alerts in Spark!")
             else:
                 txn = make_transaction()
-                producer.send(TOPIC, value=txn)
+                send_txn(producer, txn)
                 sent += 1
 
             # Throttle to target TPS

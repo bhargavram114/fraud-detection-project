@@ -38,12 +38,17 @@ storage:
 # Fraud rule thresholds — all in INR (Indian Rupees)
 # Centralised here so tuning (e.g. raising high_value_single to ₹50k)
 # requires editing one file, not hunting through code.
+# These are LOADED by jobs/fraud_detection_prod.py (load_thresholds) and passed
+# into every rule. jobs/rules/thresholds.py holds identical defaults for tests
+# and the dev job; unknown keys here make the prod job fail at startup.
 thresholds:
   velocity_txn_limit: 5           # Rule 1:  >5 txns in window → velocity flag
   velocity_window_amount: 50000   # Rule 3:  total >₹50,000 in window → high-amount flag
   high_value_single: 30000        # Rule 2:  single txn >₹30,000 → high-value flag
-  unusual_hour_start: 1           # Rule 5:  window start hour (UTC)
-  unusual_hour_end: 4             # Rule 5:  window end hour (UTC)
+  geo_velocity_countries: 2       # Rule 4:  >=2 distinct countries in window
+  unusual_hour_start: 1           # Rule 5:  local hour, inclusive (01:00:00 is flagged)
+  unusual_hour_end: 4             # Rule 5:  local hour, exclusive (04:00:00 is NOT flagged)
+  unusual_hour_timezone: "Asia/Kolkata"  # Rule 5: event_time is UTC; hour is taken in this zone
   unusual_hour_min_amount: 5000   # Rule 5:  only flag if amount >₹5,000 at odd hour
   round_amount_modulo: 1000       # Rule 6:  amount % 1000 == 0 = round amount
   round_amount_min_txns: 3        # Rule 6:  >=3 round-amount txns in window

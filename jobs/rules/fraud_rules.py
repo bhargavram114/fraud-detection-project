@@ -13,10 +13,18 @@ WHAT THIS FILE DOES NOT DO:
   - No configuration (all in config/app.yaml)
 
 WATERMARKING — WHY IT LIVES HERE AND NOT IN TRANSFORMS:
-  withWatermark() raises AnalysisException on a batch DataFrame.
-  Keeping it here means transforms.py stays batch-safe and fully testable.
-  The streaming wrapper is not unit-tested directly — it is thin enough
-  that correctness is verified through integration tests.
+  On a batch DataFrame withWatermark() is accepted and simply has no effect
+  (verified on Spark 3.5.0 — it does not raise). It lives here anyway because
+  the delay is a streaming/operational setting, not business logic: one value
+  (WATERMARK_DELAY) is applied to every rule in one place, and transforms.py
+  stays free of streaming concerns.
+  These wrappers are exercised by tests/test_streaming_smoke.py, which plans
+  and runs a real streaming query over a rate source.
+
+THRESHOLDS:
+  Each wrapper accepts an optional `thresholds` dict (see thresholds.py) and
+  forwards it to the transform. build_rules(thresholds) returns the rule list
+  with those thresholds bound, which is what the jobs use.
 
 WATERMARK VALUE (2 minutes):
   Tells Spark: "if an event arrives more than 2 minutes late relative to
@@ -36,8 +44,11 @@ ADDING A NEW RULE:
   2. Implement the transform function in transforms.py (TDD Green phase)
   3. Add a one-liner wrapper here (same pattern as all functions below)
   4. Register it in RULE_REGISTRY
+  (and add its threshold keys to thresholds.py / app.yaml if it has any)
   That's it — no other files need changing.
 """
+
+from functools import partial, update_wrapper
 
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import current_timestamp
@@ -80,46 +91,47 @@ def _with_alert_time(df: DataFrame) -> DataFrame:
 # All wrappers follow the same 3-line pattern intentionally — consistency
 # makes them easy to scan and verify at a glance.
 
-def rule_velocity_check(df: DataFrame) -> DataFrame:
-    return _with_alert_time(velocity_check(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_velocity_check(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(velocity_check(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
-def rule_high_value_single(df: DataFrame) -> DataFrame:
-    return _with_alert_time(high_value_single(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_high_value_single(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(high_value_single(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
-def rule_high_window_amount(df: DataFrame) -> DataFrame:
-    return _with_alert_time(high_window_amount(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_high_window_amount(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(high_window_amount(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
-def rule_geo_velocity(df: DataFrame) -> DataFrame:
-    return _with_alert_time(geo_velocity(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_geo_velocity(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(geo_velocity(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
-def rule_unusual_hour(df: DataFrame) -> DataFrame:
-    return _with_alert_time(unusual_hour(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_unusual_hour(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(unusual_hour(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
-def rule_round_amount_structuring(df: DataFrame) -> DataFrame:
-    return _with_alert_time(round_amount_structuring(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_round_amount_structuring(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(round_amount_structuring(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
-def rule_rapid_merchant_switch(df: DataFrame) -> DataFrame:
-    return _with_alert_time(rapid_merchant_switch(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_rapid_merchant_switch(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(rapid_merchant_switch(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
-def rule_cnp_spike(df: DataFrame) -> DataFrame:
-    return _with_alert_time(cnp_spike(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_cnp_spike(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(cnp_spike(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
-def rule_multi_card_terminal(df: DataFrame) -> DataFrame:
-    return _with_alert_time(multi_card_terminal(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_multi_card_terminal(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(multi_card_terminal(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
-def rule_sub_threshold_structuring(df: DataFrame) -> DataFrame:
-    return _with_alert_time(sub_threshold_structuring(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_sub_threshold_structuring(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(sub_threshold_structuring(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
-def rule_declined_then_approved(df: DataFrame) -> DataFrame:
-    return _with_alert_time(declined_then_approved(df.withWatermark("event_time", WATERMARK_DELAY)))
+def rule_declined_then_approved(df: DataFrame, thresholds: dict | None = None) -> DataFrame:
+    return _with_alert_time(declined_then_approved(df.withWatermark("event_time", WATERMARK_DELAY), thresholds))
 
 def rule_dormant_card(df: DataFrame, dormant_ref_df: DataFrame) -> DataFrame:
     """
     Stream-static join: streaming transactions against static dormant card list.
-    Spark automatically broadcasts the static side (small Parquet file)
-    to every executor — no explicit broadcast() call needed for stream-static.
-    The static DataFrame is read once at job startup in fraud_detection_prod.py
-    and reused for every micro-batch — it is NOT re-read per batch.
+    Verified on Spark 3.5.0: the static side is broadcast (BroadcastHashJoin)
+    while it is under spark.sql.autoBroadcastJoinThreshold (10 MB default).
+    The static DataFrame is built once at job startup in fraud_detection_prod.py
+    and is scanned again in every micro-batch, but the set of FILES is fixed at
+    startup — files the nightly job adds later are not seen until a restart.
     """
     return _with_alert_time(
         _dormant_card_transform(df.withWatermark("event_time", WATERMARK_DELAY), dormant_ref_df)
@@ -133,6 +145,8 @@ def rule_dormant_card(df: DataFrame, dormant_ref_df: DataFrame) -> DataFrame:
 #
 # The registry is iterated in apply_all_rules() — a failed rule logs an error
 # and is skipped; it does NOT bring down the whole pipeline.
+# Use build_rules(thresholds) rather than iterating RULE_REGISTRY directly when
+# thresholds should come from config/app.yaml.
 
 RULE_REGISTRY = [
     rule_velocity_check,           # Rule 1  — risk 85
@@ -148,3 +162,13 @@ RULE_REGISTRY = [
     rule_declined_then_approved,   # Rule 12 — risk 90
     # Rule 10 (rule_dormant_card) handled separately — needs dormant_ref_df
 ]
+
+
+def build_rules(thresholds: dict | None = None) -> list:
+    """
+    Return the single-DataFrame rules with `thresholds` bound.
+
+    update_wrapper copies __name__ onto the functools.partial so the jobs can
+    still log `rule_fn.__name__` when a rule fails to register.
+    """
+    return [update_wrapper(partial(fn, thresholds=thresholds), fn) for fn in RULE_REGISTRY]

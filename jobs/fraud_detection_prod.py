@@ -39,12 +39,14 @@ from datetime import datetime
 from pathlib import Path
 
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, from_json, to_json, struct, lit, md5, concat_ws
+from pyspark.sql.functions import col, from_json, to_json, struct, lit
 from pyspark.sql.types import StringType
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from jobs.schemas import TRANSACTION_SCHEMA
-from jobs.rules.fraud_rules import RULE_REGISTRY, rule_dormant_card
+from jobs.rules.fraud_rules import build_rules, rule_dormant_card
+from jobs.rules.thresholds import load_thresholds
+from jobs.rules.transforms import with_alert_id
 
 
 # ── Structured JSON Logging ───────────────────────────────────────────────────
@@ -89,6 +91,9 @@ def load_config() -> dict:
     for (section, key), env_var in overrides.items():
         if val := os.getenv(env_var):
             cfg[section][key] = val
+
+    # Fail fast on typos / unknown keys in the thresholds: section.
+    load_thresholds(cfg)
 
     log.info(f"config_loaded env={cfg['app']['env']}")
     return cfg
@@ -151,18 +156,24 @@ def read_kafka(spark: SparkSession, cfg: dict):
 # A rule that raises an exception is logged and skipped — one broken rule
 # does NOT bring down the entire pipeline (fault isolation).
 #
+# THRESHOLDS:
+#   Loaded from the `thresholds:` section of config/app.yaml and bound into
+#   every rule via build_rules(), so editing the YAML changes the behaviour.
+#
 # ALERT DEDUPLICATION:
-#   Without dedup, every micro-batch that re-evaluates the same window
-#   would re-emit the same alert. We add a deterministic alert_id:
-#   MD5(card_id | rule_triggered | window_start)
-#   Downstream consumers (case management systems) use alert_id as an
-#   idempotency key — processing the same alert_id twice has no effect.
+#   Every micro-batch re-emits a window whose aggregate changed, and one burst
+#   falls into several overlapping sliding windows. with_alert_id() (see
+#   transforms.py) hashes (card_id, rule, 1-hour bucket) so overlapping
+#   windows of one burst share an alert_id (row-level rules keep one ID per
+#   transaction). Downstream consumers use alert_id as an idempotency key —
+#   processing the same alert_id twice has no effect. A burst straddling an
+#   hour boundary can still produce two IDs; two bursts in one hour share one.
 
-def apply_all_rules(df: DataFrame, dormant_ref_df=None) -> DataFrame:
+def apply_all_rules(df: DataFrame, dormant_ref_df=None, thresholds: dict | None = None) -> DataFrame:
     alert_dfs = []
 
     # Rules 1–9, 11, 12 (stateless — single DataFrame input)
-    for rule_fn in RULE_REGISTRY:
+    for rule_fn in build_rules(thresholds):
         try:
             alert_dfs.append(rule_fn(df))
             log.info(f"rule_registered fn={rule_fn.__name__}")
@@ -184,15 +195,8 @@ def apply_all_rules(df: DataFrame, dormant_ref_df=None) -> DataFrame:
     for adf in alert_dfs[1:]:
         merged = merged.union(adf)
 
-    # Add deterministic dedup ID
-    return merged.withColumn(
-        "alert_id",
-        md5(concat_ws("|",
-            col("card_id"),
-            col("rule_triggered"),
-            col("window_start").cast("string"),
-        ))
-    )
+    # Add deterministic dedup ID (see with_alert_id for how overlapping windows collapse)
+    return with_alert_id(merged)
 
 
 # ── Output Sinks ──────────────────────────────────────────────────────────────
@@ -333,9 +337,12 @@ def main():
     log.info(f"pipeline_starting env={cfg['app']['env']}")
 
     # Load dormant card reference (stream-static join for Rule 10)
-    # This is read ONCE at startup — not re-read per micro-batch.
-    # The nightly Airflow job refreshes the Parquet file; restart the
-    # Spark job to pick up the latest dormant card list.
+    # The DataFrame is defined once here. Spark scans it again on every
+    # micro-batch, but the list of files is fixed at this moment (verified on
+    # Spark 3.5.0), so files added later by the nightly Airflow job are NOT
+    # visible. Restart the Spark job to pick up the latest dormant card list.
+    # The static side is broadcast while it is under
+    # spark.sql.autoBroadcastJoinThreshold (10 MB by default).
     dormant_ref_df = None
     try:
         dormant_ref_df = (
@@ -352,7 +359,7 @@ def main():
     good_df, bad_df = read_kafka(spark, cfg)
 
     # Apply all 12 fraud rules
-    alerts = apply_all_rules(good_df, dormant_ref_df)
+    alerts = apply_all_rules(good_df, dormant_ref_df, load_thresholds(cfg))
 
     # Fan-out to 3 independent sinks
     queries = [

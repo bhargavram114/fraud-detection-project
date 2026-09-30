@@ -5,16 +5,21 @@ kind: Namespace
 metadata:
   name: fraud-detection
 ---
-apiVersion: v1
-kind: Secret
-metadata:
-  name: fraud-detection-secrets
-  namespace: fraud-detection
-type: Opaque
-stringData:
-  KAFKA_BROKER: "kafka-internal.prod.svc.cluster.local:9092"
-  CHECKPOINT_DIR: "s3a://prod-data-lake/checkpoints/fraud-detection"
-  PARQUET_OUTPUT: "s3a://prod-data-lake/fraud-alerts"
+# ── Secrets are NOT stored in this file ──────────────────────────────────────
+# The previous version committed a Secret with plain-text stringData. Kubernetes
+# Secrets are only base64-encoded, so committing one to git leaks it to anyone
+# with repo access. Also, the three values that used to be here (broker address,
+# checkpoint path, output path) are configuration, not secrets — they now live in
+# the ConfigMap below.
+#
+# Real secrets (Kafka SASL credentials, object-store keys) are created out of
+# band and referenced by name. Pick one:
+#   kubectl -n fraud-detection create secret generic fraud-detection-secrets \
+#     --from-literal=KAFKA_SASL_CONFIG='...' \
+#     --from-literal=AWS_ACCESS_KEY_ID='...' \
+#     --from-literal=AWS_SECRET_ACCESS_KEY='...'
+#   ...or sync it from a secrets manager (External Secrets Operator, Sealed
+#   Secrets, Vault, AWS Secrets Manager) so no secret value is ever in git.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -24,6 +29,9 @@ metadata:
 data:
   APP_ENV: "prod"
   LOG_LEVEL: "WARN"
+  KAFKA_BROKER: "kafka-internal.prod.svc.cluster.local:9092"
+  CHECKPOINT_DIR: "s3a://prod-data-lake/checkpoints/fraud-detection"
+  PARQUET_OUTPUT: "s3a://prod-data-lake/fraud-alerts"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -63,10 +71,11 @@ spec:
             - spark.sql.shuffle.partitions=50
             - /app/jobs/fraud_detection_prod.py
           envFrom:
-            - secretRef:
-                name: fraud-detection-secrets
             - configMapRef:
                 name: fraud-detection-config
+            - secretRef:
+                name: fraud-detection-secrets   # created out of band (see top of file)
+                optional: true                  # clusters without SASL/S3 keys need none
           resources:
             requests: { memory: "2Gi", cpu: "1" }
             limits:   { memory: "4Gi", cpu: "2" }

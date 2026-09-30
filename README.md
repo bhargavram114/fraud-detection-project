@@ -1,7 +1,7 @@
 # ATM Fraud Detection Pipeline
 
 Real-time fraud detection using PySpark Structured Streaming + Kafka.
-12 detection rules, full TDD (51 tests), production-ready.
+12 detection rules, full TDD (83 tests), production-ready.
 
 ## Tech Stack
 | Layer       | Technology                       |
@@ -83,14 +83,17 @@ fraud-detection/
 │   ├── fraud_detection.py           ← dev job (console sink)
 │   ├── fraud_detection_prod.py      ← prod job (DLQ, health, JSON logging)
 │   └── rules/
-│       ├── transforms.py            ← 12 pure functions — batch-testable
-│       └── fraud_rules.py           ← streaming wrappers (withWatermark here only)
+│       ├── thresholds.py            ← threshold defaults + validation (mirrors app.yaml)
+│       ├── transforms.py            ← 12 pure functions + with_alert_id — batch-testable
+│       └── fraud_rules.py           ← streaming wrappers (withWatermark here only), build_rules()
 ├── producer/
 │   └── transaction_generator.py    ← ATM txn simulator + fraud bursts
 ├── tests/
 │   ├── conftest.py                  ← SparkSession + make_txn factory
-│   ├── test_schema.py               ← schema contract (5 tests)
-│   └── test_transforms.py          ← all 12 rules (46 tests) — 51 total
+│   ├── test_schema.py               ← schema contract (6 tests)
+│   ├── test_transforms.py          ← all 12 rules (52 tests)
+│   ├── test_fixes.py                ← regressions: rule 12 order, thresholds, alert_id, local hour, key (23 tests)
+│   └── test_streaming_smoke.py      ← wrappers on a real streaming query (2 tests) — 83 total
 ├── scripts/
 │   ├── setup_windows.ps1            ← one-time setup
 │   ├── run_dev.ps1                  ← start all services (auto-starts Docker)
