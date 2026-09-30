@@ -1,17 +1,42 @@
 """
 transforms.py — Pure transformation functions for all 12 fraud rules.
 
-KEY DESIGN DECISION (testability):
-  withWatermark() only works on streaming DataFrames — calling it on a
-  batch DataFrame raises AnalysisException. So concerns are separated:
+═══════════════════════════════════════════════════════════════════════════════
+KEY DESIGN DECISION — WHY SEPARATE TRANSFORMS FROM STREAMING WRAPPERS?
+═══════════════════════════════════════════════════════════════════════════════
+  withWatermark() is a streaming-only operation. Calling it on a batch
+  DataFrame raises AnalysisException. This makes rules impossible to
+  unit-test if watermarking lives inside the rule function itself.
 
-    transforms.py   — pure functions, batch-safe, fully unit-testable
-    fraud_rules.py  — streaming wrappers that add withWatermark() then
-                      delegate to these transforms
+  Solution — two layers:
 
-Output contract (every function returns these columns):
-  card_id, window_start, window_end, txn_count,
-  total_amount, rule_triggered, risk_score
+    transforms.py  (THIS FILE)
+      Pure functions. Accept any DataFrame — batch or streaming.
+      No withWatermark(). No writeStream. Just transformation logic.
+      → Fully unit-testable with spark.createDataFrame() in pytest.
+
+    fraud_rules.py (STREAMING WRAPPERS)
+      Thin wrappers. Call df.withWatermark(...) then delegate here.
+      → Not unit-tested directly; covered by integration tests.
+
+  This mirrors how you'd design it in C#:
+    Business logic in a service class (testable, no I/O).
+    Infrastructure concerns in a wrapper/adapter (hard to test, minimal code).
+
+═══════════════════════════════════════════════════════════════════════════════
+OUTPUT CONTRACT — every function must return a DataFrame with these columns:
+  card_id, window_start, window_end, txn_count, total_amount,
+  rule_triggered, risk_score
+  (alert_time is added by the streaming wrapper at write time)
+═══════════════════════════════════════════════════════════════════════════════
+
+ADDING A NEW RULE:
+  1. Write tests in tests/test_transforms.py first (TDD Red)
+  2. Add a function here following the same pattern (TDD Green)
+  3. Add a thin wrapper in fraud_rules.py
+  4. Register it in STATELESS_TRANSFORMS (or handle separately if it needs
+     extra args like dormant_card does)
+  Nothing else changes.
 """
 
 from pyspark.sql import DataFrame
@@ -20,31 +45,50 @@ from pyspark.sql.functions import (
     countDistinct, lit, when, hour, window,
 )
 
-# ── Window durations ──────────────────────────────────────────────────────────
-W5M  = ("5 minutes",  "1 minute")
-W10M = ("10 minutes", "2 minutes")
-W30M = ("30 minutes", "5 minutes")
-W1H  = ("1 hour",     "5 minutes")
+# ── Window size constants ─────────────────────────────────────────────────────
+# Format: (duration, slide_interval)
+# Sliding windows overlap — a transaction can fall into multiple windows.
+# This ensures a fraud burst that straddles a boundary is still caught.
+#
+# INTERVIEW TIP: "Why sliding and not tumbling?"
+#   Tumbling = non-overlapping. A burst of 6 txns split across two 5-min
+#   tumbling windows (3 in each) would not trigger the velocity rule.
+#   Sliding with 1-min slide means the burst appears in up to 5 windows —
+#   at least one of them will contain all 6 txns and fire the alert.
+
+W5M  = ("5 minutes",  "1 minute")   # velocity, high-amount, merchant-switch
+W10M = ("10 minutes", "2 minutes")  # CNP spike, multi-card, declined-then-approved
+W30M = ("30 minutes", "5 minutes")  # geo-velocity (impossible travel window)
+W1H  = ("1 hour",     "5 minutes")  # sub-threshold structuring (regulatory)
 
 # ── Risk scores (0–100) ───────────────────────────────────────────────────────
+# Used downstream for alert prioritisation — case management systems triage
+# by risk score. 90+ = automatic block; 70–89 = human review; <70 = monitor.
 RISK = {
     "HIGH_VELOCITY":            85,
     "HIGH_VALUE_SINGLE_TXN":   80,
     "HIGH_WINDOW_AMOUNT":       90,
-    "GEO_VELOCITY":             95,
-    "UNUSUAL_HOUR":             50,
+    "GEO_VELOCITY":             95,   # highest — physically impossible
+    "UNUSUAL_HOUR":             50,   # contextual signal only
     "ROUND_AMOUNT_STRUCTURING": 75,
     "RAPID_MERCHANT_SWITCH":    70,
     "CNP_SPIKE":                65,
     "MULTI_CARD_TERMINAL":      80,
     "DORMANT_CARD":             60,
-    "SUB_THRESHOLD_STRUCT":     85,
-    "DECLINED_THEN_APPROVED":   90,
+    "SUB_THRESHOLD_STRUCT":     85,   # regulatory compliance rule
+    "DECLINED_THEN_APPROVED":   90,   # PIN brute-force indicator
 }
 
 
 def _to_alert(df: DataFrame, rule_name: str) -> DataFrame:
-    """Standardise alert columns so union() across rules is safe."""
+    """
+    Standardise output columns so union() across all 12 rules is type-safe.
+
+    Every rule produces different intermediate columns (e.g. merchant_count,
+    country_count, decline_count). This function projects them all down to
+    the common alert contract, casting types explicitly to avoid schema
+    mismatches that would silently produce nulls in Parquet output.
+    """
     return df.select(
         col("card_id"),
         col("window_start"),
@@ -56,9 +100,31 @@ def _to_alert(df: DataFrame, rule_name: str) -> DataFrame:
     )
 
 
-# ── Rule 1: Velocity Check ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 1 — Velocity Check
+# ══════════════════════════════════════════════════════════════════════════════
 def velocity_check(df: DataFrame) -> DataFrame:
-    """Flag card with >5 transactions in any 5-minute sliding window."""
+    """
+    Flag any card with more than 5 transactions in a 5-minute sliding window.
+
+    WHY THIS CATCHES FRAUD:
+      A stolen card or cloned card is typically used in rapid succession —
+      the attacker runs as many transactions as possible before the card
+      is blocked. Legitimate cardholders rarely make 6+ transactions
+      in any 5-minute period.
+
+    WINDOW AGGREGATION:
+      groupBy(window(...), card_id) creates a stateful operator.
+      Spark maintains a state store (RocksDB by default in production)
+      keyed by (window_start, window_end, card_id).
+      Each incoming event updates the count in the relevant window(s).
+
+    INTERVIEW TIP:
+      "What happens to windows in memory?"
+      Without watermarking (applied in the streaming wrapper), windows
+      accumulate in the state store forever → OOM. The watermark tells
+      Spark it's safe to evict windows older than (max_event_time - delay).
+    """
     agg = (
         df.groupBy(window(col("event_time"), *W5M), col("card_id"))
         .agg(
@@ -72,9 +138,29 @@ def velocity_check(df: DataFrame) -> DataFrame:
     return _to_alert(agg, "HIGH_VELOCITY")
 
 
-# ── Rule 2: High Value Single Transaction ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 2 — High Value Single Transaction
+# ══════════════════════════════════════════════════════════════════════════════
 def high_value_single(df: DataFrame) -> DataFrame:
-    """Flag any single transaction exceeding ₹30,000."""
+    """
+    Flag any single transaction exceeding ₹30,000.
+
+    WHY NO WINDOW?
+      This is a stateless row-level filter — no aggregation needed.
+      Each transaction is evaluated independently. This makes it the
+      cheapest rule to execute (no state store, no shuffle).
+
+    NOTE ON window_start / window_end:
+      We set both to event_time so the output schema matches all other
+      rules, allowing clean union() in apply_all_rules(). The values
+      are semantically "the transaction happened at this instant".
+
+    INTERVIEW TIP:
+      "Why is outputMode('append') required for file sinks with watermarked
+      aggregations, but this rule could technically use any output mode?"
+      Row-level filters with no aggregation produce append-only output
+      naturally — each event either matches or doesn't, with no updates.
+    """
     filtered = (
         df.filter(col("amount") > 30_000)
         .withColumn("window_start", col("event_time"))
@@ -85,9 +171,23 @@ def high_value_single(df: DataFrame) -> DataFrame:
     return _to_alert(filtered, "HIGH_VALUE_SINGLE_TXN")
 
 
-# ── Rule 3: High Window Amount ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 3 — High Window Amount
+# ══════════════════════════════════════════════════════════════════════════════
 def high_window_amount(df: DataFrame) -> DataFrame:
-    """Flag when total spend per card exceeds ₹50,000 in any 5-min window."""
+    """
+    Flag when a card's total spend exceeds ₹50,000 in any 5-minute window.
+
+    DIFFERENCE FROM RULE 1:
+      Rule 1 catches high-frequency attacks (many small transactions).
+      Rule 3 catches high-value attacks (few large transactions that
+      individually don't cross Rule 2's single-txn threshold).
+      Example: 3 × ₹18,000 = ₹54,000 — misses Rule 1 and Rule 2,
+      but correctly triggers Rule 3.
+
+    Together, Rules 1, 2, and 3 cover the full fraud surface for
+    amount-based card abuse.
+    """
     agg = (
         df.groupBy(window(col("event_time"), *W5M), col("card_id"))
         .agg(
@@ -101,9 +201,33 @@ def high_window_amount(df: DataFrame) -> DataFrame:
     return _to_alert(agg, "HIGH_WINDOW_AMOUNT")
 
 
-# ── Rule 4: Geographic Velocity ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 4 — Geographic Velocity (Impossible Travel)
+# ══════════════════════════════════════════════════════════════════════════════
 def geo_velocity(df: DataFrame) -> DataFrame:
-    """Flag same card used in 2+ countries within 30 minutes."""
+    """
+    Flag the same card used in 2+ different countries within 30 minutes.
+
+    WHY THIS IS HIGH CONFIDENCE (risk score 95):
+      It is physically impossible to be in India and the UAE within 30
+      minutes. If the same card fires transactions in both countries in
+      that window, one of them is fraudulent — card data was stolen and
+      used remotely while the cardholder is still present in one location.
+
+    PRODUCTION ENHANCEMENT:
+      Country-level detection is a coarse proxy. In a full implementation
+      you would use lat/long coordinates and calculate Haversine distance,
+      then divide by time delta to get implied travel speed.
+      Flag if speed > 900 km/h (speed of sound — faster than any aircraft).
+      Spark UDF or a pre-computed distance lookup table handles this.
+
+    INTERVIEW TIP:
+      "How would you handle the case where the cardholder is genuinely
+      travelling between nearby countries (India → Sri Lanka)?"
+      Combine with velocity and amount rules — a single low-value
+      cross-border txn is likely legitimate; it's the burst pattern
+      that confirms fraud. Risk-score weighting helps here.
+    """
     agg = (
         df.groupBy(window(col("event_time"), *W30M), col("card_id"))
         .agg(
@@ -118,9 +242,30 @@ def geo_velocity(df: DataFrame) -> DataFrame:
     return _to_alert(agg, "GEO_VELOCITY")
 
 
-# ── Rule 5: Unusual Hour ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 5 — Unusual Hour Transaction
+# ══════════════════════════════════════════════════════════════════════════════
 def unusual_hour(df: DataFrame) -> DataFrame:
-    """Flag transactions between 01:00–04:00 UTC with amount > ₹5,000."""
+    """
+    Flag transactions between 01:00–04:00 UTC with amount > ₹5,000.
+
+    WHY BOTH CONDITIONS?
+      Late-night ATM activity is statistically anomalous but not impossible.
+      Requiring amount > ₹5,000 filters out legitimate small purchases
+      (petrol, convenience store) that happen at odd hours, and focuses
+      the rule on significant withdrawals/transfers where risk is higher.
+
+    TIMEZONE NOTE:
+      event_time is stored in UTC. In production you would join with a
+      terminal timezone lookup table to compare against local time,
+      because 2AM UTC = 7:30AM IST, which is not unusual at all.
+      For this portfolio project we use UTC as a simplification.
+
+    LOWEST RISK SCORE (50):
+      This rule is a contextual signal, not a standalone fraud indicator.
+      It should be combined with other rules in a risk-scoring engine
+      rather than used to block transactions outright.
+    """
     filtered = (
         df.filter(
             hour(col("event_time")).between(1, 4) &
@@ -134,11 +279,33 @@ def unusual_hour(df: DataFrame) -> DataFrame:
     return _to_alert(filtered, "UNUSUAL_HOUR")
 
 
-# ── Rule 6: Round Amount Structuring ─────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 6 — Round Amount Structuring
+# ══════════════════════════════════════════════════════════════════════════════
 def round_amount_structuring(df: DataFrame) -> DataFrame:
-    """Flag 3+ exact-round-amount txns (amount % 1000 == 0) in 10 minutes."""
+    """
+    Flag 3+ transactions of exact round amounts (divisible by 1000) in 10 min.
+
+    WHAT IS STRUCTURING?
+      'Structuring' (also called 'smurfing') is the practice of breaking
+      large transactions into smaller ones to avoid regulatory reporting
+      thresholds or fraud detection rules. Money mules and fraudsters
+      often transact in psychologically round amounts (₹5,000, ₹10,000)
+      because they are working from a script, not making organic purchases.
+      Legitimate consumers almost never spend exactly ₹5,000 repeatedly.
+
+    REGULATORY CONTEXT (India):
+      RBI / FIU-IND require banks to file Currency Transaction Reports (CTRs)
+      for cash transactions above ₹10 lakh. Structuring to avoid this
+      threshold violates the Prevention of Money Laundering Act (PMLA) 2002.
+
+    INTERVIEW TIP:
+      This rule demonstrates domain knowledge beyond pure engineering.
+      Mention PMLA and FIU-IND in interviews — it shows you understand
+      why the rule exists, not just how to implement it.
+    """
     agg = (
-        df.filter(col("amount") % 1000 == 0)
+        df.filter(col("amount") % 1000 == 0)     # exact round thousands only
         .groupBy(window(col("event_time"), *W10M), col("card_id"))
         .agg(
             count("txn_id").alias("txn_count"),
@@ -151,9 +318,31 @@ def round_amount_structuring(df: DataFrame) -> DataFrame:
     return _to_alert(agg, "ROUND_AMOUNT_STRUCTURING")
 
 
-# ── Rule 7: Rapid Merchant Switching ─────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 7 — Rapid Merchant Switching
+# ══════════════════════════════════════════════════════════════════════════════
 def rapid_merchant_switch(df: DataFrame) -> DataFrame:
-    """Flag card used at 4+ distinct merchants in any 5-minute window."""
+    """
+    Flag a card used at 4+ distinct merchants within a 5-minute window.
+
+    WHY THIS PATTERN INDICATES FRAUD:
+      Legitimate cardholders visit one merchant at a time and take minutes
+      to browse, select, and complete a purchase. A stolen card or cloned
+      card is 'tested' across multiple merchants rapidly — the attacker
+      is verifying the card works before attempting a large purchase.
+      This is also called 'card testing' or 'carding'.
+
+    countDistinct vs count:
+      We use countDistinct("merchant_id") not count("txn_id").
+      Multiple transactions at the same merchant (e.g. a split bill)
+      are fine — it's visiting many different merchants that's suspicious.
+
+    INTERVIEW TIP:
+      "When would you use approxCountDistinct instead of countDistinct?"
+      For very high cardinality at massive scale, HyperLogLog
+      (approxCountDistinct) is much cheaper — O(1) memory vs O(n).
+      Here, merchant_count per card per 5 min is tiny, so exact is fine.
+    """
     agg = (
         df.groupBy(window(col("event_time"), *W5M), col("card_id"))
         .agg(
@@ -168,11 +357,32 @@ def rapid_merchant_switch(df: DataFrame) -> DataFrame:
     return _to_alert(agg, "RAPID_MERCHANT_SWITCH")
 
 
-# ── Rule 8: Card-Not-Present Spike ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 8 — Card-Not-Present (CNP) Spike
+# ══════════════════════════════════════════════════════════════════════════════
 def cnp_spike(df: DataFrame) -> DataFrame:
-    """Flag 3+ ONLINE transactions from one card in 10 minutes."""
+    """
+    Flag 3+ ONLINE (Card-Not-Present) transactions from one card in 10 minutes.
+
+    WHAT IS A CNP TRANSACTION?
+      Card-Not-Present means the physical card is not swiped/tapped —
+      the cardholder (or fraudster) enters card details online or by phone.
+      CNP fraud is the dominant form of digital card fraud because stolen
+      card details (number, expiry, CVV) are sufficient — no physical card needed.
+
+    WHY PRE-FILTER BEFORE WINDOWING?
+      df.filter(col("channel") == "ONLINE") reduces the input size before
+      the expensive groupBy + window operation. The state store only holds
+      ONLINE transactions — typically 20–30% of total volume.
+      Pre-filtering before aggregation is a key PySpark performance pattern.
+
+    INTERVIEW TIP:
+      "Card details sold on dark web marketplaces (like carding forums)
+      are used exclusively online. The buyer has the numbers but not the
+      physical card. This rule specifically targets that attack vector."
+    """
     agg = (
-        df.filter(col("channel") == "ONLINE")
+        df.filter(col("channel") == "ONLINE")    # pre-filter before windowing
         .groupBy(window(col("event_time"), *W10M), col("card_id"))
         .agg(
             count("txn_id").alias("txn_count"),
@@ -185,16 +395,39 @@ def cnp_spike(df: DataFrame) -> DataFrame:
     return _to_alert(agg, "CNP_SPIKE")
 
 
-# ── Rule 9: Multiple Cards at Same Terminal ───────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 9 — Multiple Cards at Same Terminal
+# ══════════════════════════════════════════════════════════════════════════════
 def multi_card_terminal(df: DataFrame) -> DataFrame:
-    """Flag ATM terminal with 5+ distinct cards in 10 minutes (skimmer)."""
+    """
+    Flag an ATM terminal with 5+ distinct cards transacting within 10 minutes.
+
+    WHY THIS DETECTS SKIMMERS:
+      A hardware skimmer attached to an ATM captures card data for every
+      card inserted while it's installed. The fraudster then clones those
+      cards and uses them simultaneously (or in quick succession) at other
+      locations. The indicator is: many different cards flowing through
+      the SAME compromised terminal in a short window.
+
+    KEY DIFFERENCE FROM OTHER RULES:
+      This rule groups by terminal_id, not card_id.
+      The victim is the terminal (and indirectly, all its users).
+      The card_id in the output is a representative card for alert routing —
+      in production you'd alert on the terminal and notify all cards that
+      transacted at it within the detected window.
+
+    INTERVIEW TIP:
+      "This rule inverts the grouping key. Most rules ask 'is this card
+      behaving strangely?' — this one asks 'is this terminal behaving
+      strangely?' It's a supply-side vs. demand-side perspective on fraud."
+    """
     agg = (
         df.groupBy(window(col("event_time"), *W10M), col("terminal_id"))
         .agg(
             countDistinct("card_id").alias("card_count"),
             count("txn_id").alias("txn_count"),
             _sum("amount").alias("total_amount"),
-            _max("card_id").alias("card_id"),
+            _max("card_id").alias("card_id"),   # representative card for output schema
         )
         .filter(col("card_count") > 5)
         .withColumn("window_start", col("window.start"))
@@ -203,15 +436,43 @@ def multi_card_terminal(df: DataFrame) -> DataFrame:
     return _to_alert(agg, "MULTI_CARD_TERMINAL")
 
 
-# ── Rule 10: Dormant Card Activation ─────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 10 — Dormant Card Sudden Activation
+# ══════════════════════════════════════════════════════════════════════════════
 def dormant_card(df: DataFrame, dormant_ref_df: DataFrame) -> DataFrame:
     """
-    Flag transactions by cards inactive for 30+ days.
-    dormant_ref_df: DataFrame with a single 'card_id' column.
-    In the streaming job this is a static DataFrame — Spark automatically
-    broadcasts the smaller side of the join.
+    Flag transactions from cards that have been inactive for 30+ days.
+
+    HOW THE DORMANT LIST IS BUILT:
+      A nightly Airflow DAG (batch job) queries the transaction history,
+      finds all card_ids with no activity in the last 30 days, and writes
+      that list to a Parquet file (the dormant reference dataset).
+      At streaming job startup, fraud_detection_prod.py reads this file
+      as a static DataFrame and passes it here.
+
+    STREAM-STATIC JOIN PATTERN:
+      This is a "stream-static join" — one side is the live event stream,
+      the other is a static lookup table. Spark automatically broadcasts
+      the static side (small, fits in memory) to every executor.
+      No shuffle needed — this is the most efficient join type in Spark.
+      In contrast, stream-stream joins require both sides to be watermarked
+      and involve complex state management.
+
+    WHY DORMANT CARD FRAUD HAPPENS:
+      Fraudsters sometimes obtain card details but wait weeks or months
+      before using them — waiting for the cardholder to forget about the
+      card or for fraud monitoring to relax. A sudden activation after
+      a long dormancy period is a strong signal.
+
+    INTERVIEW TIP:
+      This is the Lambda Architecture pattern in practice:
+        Batch layer  → nightly job computes dormant cards
+        Speed layer  → streaming job joins against the batch output
+      Mention Kappa Architecture as an alternative (pure streaming,
+      no separate batch) for bonus points.
     """
     filtered = (
+        # Inner join — only rows where card_id appears in the dormant list
         df.join(dormant_ref_df.select("card_id"), on="card_id", how="inner")
         .withColumn("window_start", col("event_time"))
         .withColumn("window_end",   col("event_time"))
@@ -221,11 +482,32 @@ def dormant_card(df: DataFrame, dormant_ref_df: DataFrame) -> DataFrame:
     return _to_alert(filtered, "DORMANT_CARD")
 
 
-# ── Rule 11: Sub-Threshold Structuring ───────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 11 — Sub-Threshold Structuring
+# ══════════════════════════════════════════════════════════════════════════════
 def sub_threshold_structuring(df: DataFrame) -> DataFrame:
     """
-    Flag 5+ txns between ₹9,000–₹9,999 in 1 hour.
-    Detects structuring to avoid the ₹10,000 RBI/FIU-IND reporting threshold.
+    Flag 5+ transactions each between ₹9,000–₹9,999 within a 1-hour window.
+
+    THE ₹10,000 REGULATORY THRESHOLD:
+      Banks in India are required to report individual cash transactions
+      above ₹10,000 to RBI / FIU-IND under the Prevention of Money
+      Laundering Act (PMLA) 2002. Fraudsters and money launderers
+      deliberately keep each transaction just below ₹10,000 to avoid
+      triggering these reports. Repeated sub-threshold transactions that
+      collectively represent a large transfer are the tell.
+
+    WHY A 1-HOUR WINDOW (not 5 or 10 minutes)?
+      Sophisticated structurers space transactions to avoid velocity rules.
+      A 1-hour window with a 5-minute slide catches the pattern even when
+      transactions are spread across the hour rather than bunched together.
+
+    DISTINCTION FROM RULE 6 (Round Amount Structuring):
+      Rule 6 catches psychologically round amounts (₹5,000, ₹10,000).
+      Rule 11 catches amounts just BELOW a regulatory threshold (₹9,800,
+      ₹9,950, ₹9,999) — a different and more deliberate structuring pattern.
+      Both rules can fire on the same card simultaneously, which increases
+      the combined risk signal.
     """
     agg = (
         df.filter((col("amount") >= 9_000) & (col("amount") < 10_000))
@@ -241,26 +523,63 @@ def sub_threshold_structuring(df: DataFrame) -> DataFrame:
     return _to_alert(agg, "SUB_THRESHOLD_STRUCT")
 
 
-# ── Rule 12: Declined then Approved ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RULE 12 — Declined then Approved
+# ══════════════════════════════════════════════════════════════════════════════
 def declined_then_approved(df: DataFrame) -> DataFrame:
     """
-    Flag card with 2+ DECLINED txns followed by an APPROVED txn
-    in the same 10-minute window. Detects PIN brute-force / card testing.
+    Flag a card with 2+ DECLINED transactions followed by an APPROVED one
+    within the same 10-minute window.
 
-    Uses conditional aggregation (single groupBy) instead of a
-    stream-stream join — simpler state management, fully testable in batch.
+    WHY THIS DETECTS PIN BRUTE-FORCE / CARD TESTING:
+      When a stolen card is used at an ATM with an unknown PIN, the attacker
+      tries multiple PINs until one works (or the card is swallowed after 3
+      attempts). In online fraud, card details may be incomplete (missing CVV
+      or billing address) — the fraudster probes multiple merchants until one
+      approves. This rule detects the pattern of multiple failures followed
+      by a success.
+
+    YOUR ATM BACKGROUND ADVANTAGE:
+      In NDC protocol, response code 'Unable to Process' and ISO response
+      code '05 (Do Not Honour)' are decline codes you've handled in
+      Activate Enterprise. This rule detects exactly the pattern you'd see
+      in ATM switch logs before a successful authorisation — now at the
+      analytics layer instead of the protocol layer.
+
+    IMPLEMENTATION CHOICE — Conditional Aggregation vs Stream-Stream Join:
+      Option A (original): stream-stream join between a declines stream and
+        an approvals stream. Requires both sides to be watermarked, complex
+        state management, harder to test.
+      Option B (this implementation): single groupBy with conditional
+        aggregation using when(). One pass, no join, no extra state,
+        fully testable in batch mode.
+
+        count(when(col("txn_status") == "DECLINED", 1))
+          → counts only DECLINED rows within each window group
+        count(when(col("txn_status") == "APPROVED", 1))
+          → counts only APPROVED rows within each window group
+
+      Option B is simpler, faster, and produces identical results.
+      This is the correct production approach.
+
+    INTERVIEW TIP:
+      If asked "why not a stream-stream join?", explain the trade-offs:
+      stream-stream joins require both sides watermarked, create two
+      separate state stores, and complicate checkpoint recovery. The
+      conditional aggregation achieves the same logic in one operator.
     """
     agg = (
         df.groupBy(window(col("event_time"), *W10M), col("card_id"))
         .agg(
+            # Conditional counts — count only rows matching each status
             count(when(col("txn_status") == "DECLINED", 1)).alias("decline_count"),
             count(when(col("txn_status") == "APPROVED", 1)).alias("approve_count"),
             count("txn_id").alias("txn_count"),
             _sum("amount").alias("total_amount"),
         )
         .filter(
-            (col("decline_count") >= 2) &
-            (col("approve_count") >= 1)
+            (col("decline_count") >= 2) &   # at least 2 failures
+            (col("approve_count") >= 1)      # followed by at least 1 success
         )
         .withColumn("window_start", col("window.start"))
         .withColumn("window_end",   col("window.end"))
@@ -268,8 +587,12 @@ def declined_then_approved(df: DataFrame) -> DataFrame:
     return _to_alert(agg, "DECLINED_THEN_APPROVED")
 
 
-# ── Registry ──────────────────────────────────────────────────────────────────
-# dormant_card excluded — needs a second argument (reference DataFrame)
+# ── Rule registry ─────────────────────────────────────────────────────────────
+# All stateless transforms (single DataFrame input).
+# dormant_card is excluded because it requires a second argument
+# (the reference DataFrame) — it is handled separately in fraud_rules.py.
+# To add a new rule: implement the function above, append it here.
+
 STATELESS_TRANSFORMS = [
     velocity_check,
     high_value_single,

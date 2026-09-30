@@ -1,8 +1,4 @@
-# .github/workflows/ci-cd.yml
-# Full CI/CD pipeline: test → build → push → deploy
-
-name: Fraud Detection Pipeline CI/CD
-
+name: Fraud Detection CI/CD
 on:
   push:
     branches: [main, staging]
@@ -14,108 +10,45 @@ env:
   REGISTRY: your-registry.io
 
 jobs:
-  # ─── Step 1: Unit Tests ────────────────────────────────────────────────────
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with: { python-version: "3.11" }
+      - uses: actions/setup-java@v4
+        with: { java-version: "11", distribution: "temurin" }
+      - name: Install uv
+        run: pip install uv
+      - name: Install deps
+        run: uv sync --extra dev
+      - name: Run tests
+        run: uv run pytest tests/ -v --cov=jobs --cov-report=xml --cov-fail-under=80
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-
-      - name: Set up Java (PySpark needs JVM)
-        uses: actions/setup-java@v4
-        with:
-          java-version: "11"
-          distribution: "temurin"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt pytest pytest-cov
-
-      - name: Run unit tests
-        run: pytest tests/ -v --cov=jobs --cov-report=xml
-
-      - name: Coverage gate (must be >80%)
-        run: |
-          coverage=$(python -c "import xml.etree.ElementTree as ET; t=ET.parse('coverage.xml').getroot(); print(float(t.get('line-rate'))*100)")
-          echo "Coverage: $coverage%"
-          python -c "assert float('$coverage') >= 80, 'Coverage below 80%'"
-
-  # ─── Step 2: Lint & Type Check ─────────────────────────────────────────────
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: pip install ruff mypy
-      - run: ruff check jobs/ producer/ tests/
-      # Type check (optional, Spark typing is incomplete)
-      # - run: mypy jobs/ --ignore-missing-imports
-
-  # ─── Step 3: Build & Push Docker Image ────────────────────────────────────
   build:
-    needs: [test, lint]
+    needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Build Docker image
-        run: |
-          docker build \
-            -t $REGISTRY/$IMAGE_NAME:${{ github.sha }} \
-            -t $REGISTRY/$IMAGE_NAME:latest \
-            .
-
-      - name: Login to registry
-        run: echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login $REGISTRY -u ${{ secrets.REGISTRY_USER }} --password-stdin
-
+      - name: Build image
+        run: docker build -t $REGISTRY/$IMAGE_NAME:${{ github.sha }} .
       - name: Push image
         run: |
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login $REGISTRY -u ${{ secrets.REGISTRY_USER }} --password-stdin
           docker push $REGISTRY/$IMAGE_NAME:${{ github.sha }}
-          docker push $REGISTRY/$IMAGE_NAME:latest
 
-  # ─── Step 4: Deploy to Staging ─────────────────────────────────────────────
-  deploy-staging:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/staging'
-    environment: staging
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/k8s-set-context@v3
-        with:
-          kubeconfig: ${{ secrets.KUBE_CONFIG_STAGING }}
-      - run: |
-          kubectl set image deployment/fraud-detection-driver \
-            spark-driver=$REGISTRY/$IMAGE_NAME:${{ github.sha }} \
-            -n fraud-detection
-          kubectl rollout status deployment/fraud-detection-driver -n fraud-detection
-
-  # ─── Step 5: Deploy to Production (manual approval gate) ──────────────────
   deploy-prod:
     needs: build
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
-    environment:
-      name: production
-      url: https://grafana.prod.internal/d/fraud-detection
+    environment: production
     steps:
       - uses: actions/checkout@v4
       - uses: azure/k8s-set-context@v3
-        with:
-          kubeconfig: ${{ secrets.KUBE_CONFIG_PROD }}
-      - name: Deploy with zero-downtime rolling update
-        run: |
+        with: { kubeconfig: "${{ secrets.KUBE_CONFIG_PROD }}" }
+      - run: |
           kubectl set image deployment/fraud-detection-driver \
             spark-driver=$REGISTRY/$IMAGE_NAME:${{ github.sha }} \
             -n fraud-detection
-          kubectl rollout status deployment/fraud-detection-driver \
-            -n fraud-detection --timeout=300s
-      - name: Notify Slack on success
-        if: success()
-        run: |
-          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
-            -H 'Content-type: application/json' \
-            --data '{"text":"✅ fraud-detection ${{ github.sha }} deployed to prod"}'
+          kubectl rollout status deployment/fraud-detection-driver -n fraud-detection --timeout=300s

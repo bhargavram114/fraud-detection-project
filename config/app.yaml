@@ -1,6 +1,12 @@
 # app.yaml — Fraud Detection Pipeline Configuration
-# Values here are defaults overridden by environment variables in production
-# Pattern: config["kafka"]["broker"] is overridden by env KAFKA_BROKER
+#
+# OVERRIDE PRIORITY (highest to lowest):
+#   1. Environment variables (set in K8s Secrets / docker run -e)
+#   2. This file (checked into git — no secrets here)
+#
+# RULE: Never put passwords, API keys, or Kafka credentials in this file.
+#       Use environment variables for all secrets. The prod job reads
+#       overrides from env vars defined in fraud_detection_prod.py.
 
 app:
   name: "atm-fraud-detection"
@@ -8,46 +14,52 @@ app:
   env: "local"          # local | dev | staging | prod
 
 kafka:
-  broker: "localhost:9092"                     # prod: internal LB endpoint
-  input_topic: "transactions"
-  alert_topic: "fraud-alerts"
-  dlq_topic: "fraud-detection-dlq"            # dead-letter queue for bad msgs
-  schema_registry_url: "http://localhost:8081" # Confluent Schema Registry
+  broker: "localhost:9092"            # prod override: KAFKA_BROKER env var
+  input_topic: "transactions"         # stream of raw ATM transactions
+  alert_topic: "fraud-alerts"         # detected fraud alerts (consumers: notification, case mgmt)
+  dlq_topic: "fraud-detection-dlq"   # dead-letter queue for unparseable messages
   consumer_group: "fraud-detection-v1"
-  max_offsets_per_trigger: 10000              # backpressure control
-  starting_offsets: "latest"                  # prod: "latest" | backfill: "earliest"
+  max_offsets_per_trigger: 10000     # backpressure — max records per micro-batch per partition
+  starting_offsets: "latest"         # use "earliest" only for backfill / replay
 
 spark:
-  shuffle_partitions: 4         # match Kafka partition count locally; 50-200 in prod
-  checkpoint_dir: "/tmp/fraud-detection-checkpoints"  # prod: s3://bucket/checkpoints
-  trigger_interval: "10 seconds"
-  adaptive_enabled: true
-  log_level: "WARN"
+  shuffle_partitions: 4       # local: match CPU cores. Prod: 50-200 (match Kafka partitions)
+                               # WARNING: default 200 is catastrophic for streaming — 200 empty tasks per batch
+  checkpoint_dir: "/tmp/fraud-detection-checkpoints"   # prod override: CHECKPOINT_DIR (use S3/ADLS)
+  trigger_interval: "10 seconds"   # micro-batch interval for Kafka/console sinks
+  adaptive_enabled: true            # AQE — let Spark optimise at runtime
+  log_level: "WARN"                 # suppress INFO noise; use ERROR in prod
 
 storage:
-  parquet_output: "/tmp/fraud-detection-output"  # prod: s3://bucket/fraud-alerts
-  dormant_cards_path: "/tmp/dormant-cards"       # prod: s3://bucket/reference/dormant
+  parquet_output: "/tmp/fraud-detection-output"        # prod override: PARQUET_OUTPUT
+  dormant_cards_path: "/tmp/dormant-cards"             # written nightly by Airflow batch job
+                                                        # prod override: DORMANT_CARDS_PATH
 
+# Fraud rule thresholds — all in INR (Indian Rupees)
+# Centralised here so tuning (e.g. raising high_value_single to ₹50k)
+# requires editing one file, not hunting through code.
 thresholds:
-  velocity_txn_limit: 5
-  velocity_window_amount: 50000
-  high_value_single: 30000
-  unusual_hour_min_amount: 5000
-  round_amount_min_txns: 3
-  rapid_merchant_distinct: 4
-  cnp_spike_txns: 3
-  multi_card_terminal: 5
-  sub_threshold_low: 9000
-  sub_threshold_high: 10000
-  sub_threshold_min_txns: 5
-  decline_min_count: 2
-  geo_velocity_countries: 2
+  velocity_txn_limit: 5           # Rule 1:  >5 txns in window → velocity flag
+  velocity_window_amount: 50000   # Rule 3:  total >₹50,000 in window → high-amount flag
+  high_value_single: 30000        # Rule 2:  single txn >₹30,000 → high-value flag
+  unusual_hour_start: 1           # Rule 5:  window start hour (UTC)
+  unusual_hour_end: 4             # Rule 5:  window end hour (UTC)
+  unusual_hour_min_amount: 5000   # Rule 5:  only flag if amount >₹5,000 at odd hour
+  round_amount_modulo: 1000       # Rule 6:  amount % 1000 == 0 = round amount
+  round_amount_min_txns: 3        # Rule 6:  >=3 round-amount txns in window
+  rapid_merchant_distinct: 4      # Rule 7:  >4 distinct merchants in window
+  cnp_spike_txns: 3               # Rule 8:  >3 ONLINE txns in window
+  multi_card_terminal: 5          # Rule 9:  >5 distinct cards at one terminal
+  sub_threshold_low: 9000         # Rule 11: lower bound of structuring band
+  sub_threshold_high: 10000       # Rule 11: upper bound (RBI reporting threshold)
+  sub_threshold_min_txns: 5       # Rule 11: >=5 sub-threshold txns in 1-hour window
+  decline_min_count: 2            # Rule 12: >=2 declines before approval
 
 monitoring:
   prometheus_port: 9090
-  health_check_port: 8090
+  health_check_port: 8090          # K8s liveness/readiness probe hits GET /health
   metrics_prefix: "fraud_detection"
 
 alerting:
-  pagerduty_integration_key: ""   # set via env in prod
-  slack_webhook_url: ""           # set via env in prod
+  pagerduty_integration_key: ""   # set via env in prod — never hardcode
+  slack_webhook_url: ""           # set via env in prod — never hardcode
